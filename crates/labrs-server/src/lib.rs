@@ -160,9 +160,7 @@ async fn handle_client_msg(
             let formatted = session.edit_preamble(&source)?;
             send_msg(
                 socket,
-                &ServerMessage::PreambleFormatted {
-                    source: formatted,
-                },
+                &ServerMessage::PreambleFormatted { source: formatted },
             )
             .await?;
             if session.auto_react {
@@ -361,13 +359,7 @@ async fn run_dirty_streaming(
             continue;
         }
 
-        send_msg(
-            socket,
-            &ServerMessage::CellRunning {
-                name: name.clone(),
-            },
-        )
-        .await?;
+        send_msg(socket, &ServerMessage::CellRunning { name: name.clone() }).await?;
 
         match session.run_cell_once(&name) {
             Ok((out, _)) => {

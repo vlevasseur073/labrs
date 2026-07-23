@@ -160,11 +160,7 @@ impl Executor {
             }))
     }
 
-    fn materialize_runner(
-        &self,
-        notebook: &Notebook,
-        graph: &DependencyGraph,
-    ) -> Result<PathBuf> {
+    fn materialize_runner(&self, notebook: &Notebook, graph: &DependencyGraph) -> Result<PathBuf> {
         let hash = short_hash(&notebook.source);
         let dir = self.cache_dir.join(format!("run_all_{hash}"));
         fs::create_dir_all(dir.join("src"))?;
@@ -302,9 +298,18 @@ fn generate_run_all(notebook: &Notebook, graph: &DependencyGraph) -> Result<Stri
         // Bind results at main scope (no nested block) so dependents can see them.
         code.push_str("    let mut stdout_buf = BufferRedirect::stdout().unwrap();\n");
         code.push_str("    let mut stderr_buf = BufferRedirect::stderr().unwrap();\n");
-        code.push_str(&format!("    let __result_{} = (|| {{ {call} }})();\n", cell.name));
-        code.push_str(&format!("    let mut __stdout_{} = String::new();\n", cell.name));
-        code.push_str(&format!("    let mut __stderr_{} = String::new();\n", cell.name));
+        code.push_str(&format!(
+            "    let __result_{} = (|| {{ {call} }})();\n",
+            cell.name
+        ));
+        code.push_str(&format!(
+            "    let mut __stdout_{} = String::new();\n",
+            cell.name
+        ));
+        code.push_str(&format!(
+            "    let mut __stderr_{} = String::new();\n",
+            cell.name
+        ));
         code.push_str(&format!(
             "    stdout_buf.read_to_string(&mut __stdout_{}).ok();\n",
             cell.name
@@ -339,7 +344,10 @@ fn generate_run_all(notebook: &Notebook, graph: &DependencyGraph) -> Result<Stri
             "    println!(\"___LABRS_CELL_END___{}___\");\n",
             cell.name
         ));
-        code.push_str(&format!("    let {} = __result_{};\n", cell.name, cell.name));
+        code.push_str(&format!(
+            "    let {} = __result_{};\n",
+            cell.name, cell.name
+        ));
         code.push_str(&format!(
             "    let _ = (&__stdout_{}, &__stderr_{}, &__value_{}, &{});\n",
             cell.name, cell.name, cell.name, cell.name
@@ -608,7 +616,9 @@ fn skip_leading_docs(source: &str) -> usize {
     let mut i = 0;
     let bytes = source.as_bytes();
     while i < bytes.len() {
-        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r') {
+        while i < bytes.len()
+            && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+        {
             i += 1;
         }
         if source[i..].starts_with("//!") || source[i..].starts_with("//") {

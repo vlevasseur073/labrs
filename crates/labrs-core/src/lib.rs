@@ -12,9 +12,7 @@ pub mod source_util;
 pub use diagnose::{Diagnostic, Severity};
 pub use execute::{CellOutput, ExecuteOptions, Executor};
 pub use graph::{DependencyGraph, GraphError};
-pub use notebook::{
-    Cell, CellId, Helper, ItemKind, MarkdownCell, Notebook, OrderEntry, SharedDef,
-};
+pub use notebook::{Cell, CellId, Helper, ItemKind, MarkdownCell, Notebook, OrderEntry, SharedDef};
 pub use parse::parse_notebook;
 pub use session::{AddKind, CellState, CellStatus, MoveDirection, Session, SessionSnapshot};
 pub use source_util::{strip_labrs_attrs, with_labrs_attr};

@@ -218,13 +218,8 @@ impl Session {
         };
 
         let (k2, n2) = &movable[swap_with];
-        let new_file = swap_item_blocks(
-            &self.notebook.source,
-            kind.as_str(),
-            name,
-            k2.as_str(),
-            n2,
-        )?;
+        let new_file =
+            swap_item_blocks(&self.notebook.source, kind.as_str(), name, k2.as_str(), n2)?;
         write_notebook(&self.path, &new_file)?;
         let _ = rustfmt_file(&self.path);
         self.reload()?;
@@ -271,7 +266,12 @@ impl Session {
         SessionSnapshot {
             path: self.path.clone(),
             cells,
-            helpers: self.notebook.helpers.iter().map(|h| h.name.clone()).collect(),
+            helpers: self
+                .notebook
+                .helpers
+                .iter()
+                .map(|h| h.name.clone())
+                .collect(),
             definitions: self
                 .notebook
                 .definitions
@@ -322,12 +322,8 @@ impl Session {
             .clone();
         let stripped = strip_labrs_attrs(new_source);
         let formatted = rustfmt_cell_source(&stripped);
-        let new_file = replace_helper_source(
-            &self.notebook.source,
-            name,
-            &helper.source,
-            &formatted,
-        )?;
+        let new_file =
+            replace_helper_source(&self.notebook.source, name, &helper.source, &formatted)?;
         write_notebook(&self.path, &new_file)?;
         let _ = rustfmt_file(&self.path);
         self.reload()?;
@@ -476,11 +472,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn add_item(
-        &mut self,
-        kind: AddKind,
-        after: Option<(AddKind, String)>,
-    ) -> Result<String> {
+    pub fn add_item(&mut self, kind: AddKind, after: Option<(AddKind, String)>) -> Result<String> {
         let mut names: Vec<String> = self.notebook.cells.iter().map(|c| c.name.clone()).collect();
         names.extend(self.notebook.helpers.iter().map(|h| h.name.clone()));
         names.extend(self.notebook.markdown.iter().map(|m| m.name.clone()));
@@ -531,10 +523,7 @@ impl Session {
                     .notebook
                     .cell(name)
                     .with_context(|| format!("unknown cell `{name}`"))?;
-                let content = cell
-                    .docs
-                    .clone()
-                    .unwrap_or_else(|| format!("# {name}\n"));
+                let content = cell.docs.clone().unwrap_or_else(|| format!("# {name}\n"));
                 let lit = serde_json::to_string(&content).unwrap();
                 format!("#[labrs::markdown]\npub const {name}: &str = {lit};\n")
             }
@@ -546,9 +535,7 @@ impl Session {
                     .find(|m| m.name == name)
                     .with_context(|| format!("unknown markdown `{name}`"))?;
                 let lit = serde_json::to_string(&md.content).unwrap();
-                format!(
-                    "#[labrs::cell]\npub fn {name}() -> String {{\n    {lit}.to_string()\n}}\n"
-                )
+                format!("#[labrs::cell]\npub fn {name}() -> String {{\n    {lit}.to_string()\n}}\n")
             }
             (AddKind::Helper, AddKind::Markdown) => {
                 let content = format!("# {name}\n");
@@ -581,8 +568,7 @@ impl Session {
         Ok(match kind {
             AddKind::Cell => {
                 let name = fresh_name(names, "cell");
-                let block =
-                    format!("#[labrs::cell]\npub fn {name}() -> i32 {{\n    0\n}}\n");
+                let block = format!("#[labrs::cell]\npub fn {name}() -> i32 {{\n    0\n}}\n");
                 (name, block)
             }
             AddKind::Helper => {

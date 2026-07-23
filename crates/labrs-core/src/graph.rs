@@ -163,7 +163,8 @@ pub fn build_graph(notebook: &Notebook) -> DependencyGraph {
         levels.push(level);
     }
 
-    if order.len() != notebook.cells.len() && diagnostics.iter().all(|d| d.severity != Severity::Error)
+    if order.len() != notebook.cells.len()
+        && diagnostics.iter().all(|d| d.severity != Severity::Error)
     {
         let in_order: HashSet<_> = order.iter().collect();
         let cycle_nodes: Vec<_> = notebook
@@ -241,11 +242,12 @@ pub fn double(val: &u16) -> u16 { 2 * (*val) }
 "#;
         let nb = parse_notebook_source("t.rs", src.to_string()).unwrap();
         let g = build_graph(&nb);
-        assert!(g.edges.iter().any(|e| e.from == "greeting" && e.to == "process"));
-        assert!(g.errors().any(|d| d.cell.as_deref() == Some("double")));
         assert!(g
-            .errors()
-            .any(|d| d.message.contains("plain `fn`")));
+            .edges
+            .iter()
+            .any(|e| e.from == "greeting" && e.to == "process"));
+        assert!(g.errors().any(|d| d.cell.as_deref() == Some("double")));
+        assert!(g.errors().any(|d| d.message.contains("plain `fn`")));
     }
 
     #[test]

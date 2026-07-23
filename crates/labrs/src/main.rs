@@ -24,13 +24,9 @@ enum Commands {
         workspace: bool,
     },
     /// Parse and print the dependency graph
-    Graph {
-        file: PathBuf,
-    },
+    Graph { file: PathBuf },
     /// Format the notebook with rustfmt
-    Fmt {
-        file: PathBuf,
-    },
+    Fmt { file: PathBuf },
     /// Run all cells in topological order
     Run {
         file: PathBuf,
@@ -67,7 +63,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Run { file, no_fmt } => cmd_run(&file, !no_fmt),
-        Commands::Serve { file, port, no_auto } => {
+        Commands::Serve {
+            file,
+            port,
+            no_auto,
+        } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(labrs_server::serve_with_options(file, port, !no_auto))
         }
@@ -167,7 +167,11 @@ fn cmd_graph(file: &Path) -> Result<()> {
     if !nb.helpers.is_empty() {
         println!("Helpers (not in DAG):");
         for h in &nb.helpers {
-            println!("  - {}{}", h.name, if h.explicit { " #[labrs::helper]" } else { "" });
+            println!(
+                "  - {}{}",
+                h.name,
+                if h.explicit { " #[labrs::helper]" } else { "" }
+            );
         }
         println!();
     }

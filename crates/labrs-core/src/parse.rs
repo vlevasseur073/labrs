@@ -1,8 +1,6 @@
 //! Parse a labrs notebook `.rs` file into structured items.
 
-use crate::notebook::{
-    Cell, Helper, MarkdownCell, Notebook, OrderEntry, Param, SharedDef,
-};
+use crate::notebook::{Cell, Helper, MarkdownCell, Notebook, OrderEntry, Param, SharedDef};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
@@ -25,12 +23,8 @@ pub fn parse_notebook_source(
     source: String,
 ) -> Result<Notebook> {
     let path = path.into();
-    let file = syn::parse_file(&source).with_context(|| {
-        format!(
-            "failed to parse Rust syntax in {}",
-            path.display()
-        )
-    })?;
+    let file = syn::parse_file(&source)
+        .with_context(|| format!("failed to parse Rust syntax in {}", path.display()))?;
 
     let mut cells = Vec::new();
     let mut helpers = Vec::new();
@@ -40,49 +34,104 @@ pub fn parse_notebook_source(
 
     for item in file.items {
         match item {
-            Item::Fn(func) => classify_fn(
-                &source,
-                func,
-                &mut cells,
-                &mut helpers,
-                &mut order,
-            )?,
+            Item::Fn(func) => classify_fn(&source, func, &mut cells, &mut helpers, &mut order)?,
             Item::Const(item_const) => {
                 if has_labrs_attr(&item_const.attrs, "markdown") {
                     let md = parse_markdown(&source, item_const)?;
-                    order.push(OrderEntry::Markdown {
-                        id: md.id.clone(),
-                    });
+                    order.push(OrderEntry::Markdown { id: md.id.clone() });
                     markdown.push(md);
                 } else {
-                    push_def(&source, "const", item_name_const(&item_const), &item_const, &mut definitions, &mut order);
+                    push_def(
+                        &source,
+                        "const",
+                        item_name_const(&item_const),
+                        &item_const,
+                        &mut definitions,
+                        &mut order,
+                    );
                 }
             }
             Item::Struct(s) => {
-                push_def_item(&source, "struct", s.ident.to_string(), Item::Struct(s), &mut definitions, &mut order);
+                push_def_item(
+                    &source,
+                    "struct",
+                    s.ident.to_string(),
+                    Item::Struct(s),
+                    &mut definitions,
+                    &mut order,
+                );
             }
             Item::Enum(e) => {
-                push_def_item(&source, "enum", e.ident.to_string(), Item::Enum(e), &mut definitions, &mut order);
+                push_def_item(
+                    &source,
+                    "enum",
+                    e.ident.to_string(),
+                    Item::Enum(e),
+                    &mut definitions,
+                    &mut order,
+                );
             }
             Item::Type(t) => {
-                push_def_item(&source, "type", t.ident.to_string(), Item::Type(t), &mut definitions, &mut order);
+                push_def_item(
+                    &source,
+                    "type",
+                    t.ident.to_string(),
+                    Item::Type(t),
+                    &mut definitions,
+                    &mut order,
+                );
             }
             Item::Trait(t) => {
-                push_def_item(&source, "trait", t.ident.to_string(), Item::Trait(t), &mut definitions, &mut order);
+                push_def_item(
+                    &source,
+                    "trait",
+                    t.ident.to_string(),
+                    Item::Trait(t),
+                    &mut definitions,
+                    &mut order,
+                );
             }
             Item::Impl(i) => {
                 let name = format!("impl_{}", definitions.len());
-                push_def_item(&source, "impl", name, Item::Impl(i), &mut definitions, &mut order);
+                push_def_item(
+                    &source,
+                    "impl",
+                    name,
+                    Item::Impl(i),
+                    &mut definitions,
+                    &mut order,
+                );
             }
             Item::Use(u) => {
                 let name = format!("use_{}", definitions.len());
-                push_def_item(&source, "use", name, Item::Use(u), &mut definitions, &mut order);
+                push_def_item(
+                    &source,
+                    "use",
+                    name,
+                    Item::Use(u),
+                    &mut definitions,
+                    &mut order,
+                );
             }
             Item::Mod(m) => {
-                push_def_item(&source, "mod", m.ident.to_string(), Item::Mod(m), &mut definitions, &mut order);
+                push_def_item(
+                    &source,
+                    "mod",
+                    m.ident.to_string(),
+                    Item::Mod(m),
+                    &mut definitions,
+                    &mut order,
+                );
             }
             Item::Static(s) => {
-                push_def_item(&source, "static", s.ident.to_string(), Item::Static(s), &mut definitions, &mut order);
+                push_def_item(
+                    &source,
+                    "static",
+                    s.ident.to_string(),
+                    Item::Static(s),
+                    &mut definitions,
+                    &mut order,
+                );
             }
             other => {
                 // Keep unknown items as opaque definitions so we don't drop them on rewrite.
@@ -138,9 +187,7 @@ fn classify_fn(
         })
         .trim()
         .to_string();
-        order.push(OrderEntry::Helper {
-            name: name.clone(),
-        });
+        order.push(OrderEntry::Helper { name: name.clone() });
         helpers.push(Helper {
             name,
             docs,
@@ -274,9 +321,7 @@ fn push_def(
     order: &mut Vec<OrderEntry>,
 ) {
     let span = item_span(source, item.span());
-    order.push(OrderEntry::Definition {
-        name: name.clone(),
-    });
+    order.push(OrderEntry::Definition { name: name.clone() });
     definitions.push(SharedDef {
         name,
         kind: kind.to_string(),
@@ -310,9 +355,7 @@ fn push_def_item(
         Item::Static(s) => item_span(source, s.span()),
         _ => (0, 0),
     };
-    order.push(OrderEntry::Definition {
-        name: name.clone(),
-    });
+    order.push(OrderEntry::Definition { name: name.clone() });
     definitions.push(SharedDef {
         name,
         kind: kind.to_string(),

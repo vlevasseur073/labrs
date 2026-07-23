@@ -10,7 +10,10 @@ pub async fn index() -> Html<&'static str> {
 pub async fn app_js() -> Response {
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         APP_JS,
     )
         .into_response()

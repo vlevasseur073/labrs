@@ -7,11 +7,25 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     GetState,
-    EditCell { name: String, source: String },
-    EditHelper { name: String, source: String },
-    EditDefinition { name: String, source: String },
-    EditPreamble { source: String },
-    EditMarkdown { name: String, content: String },
+    EditCell {
+        name: String,
+        source: String,
+    },
+    EditHelper {
+        name: String,
+        source: String,
+    },
+    EditDefinition {
+        name: String,
+        source: String,
+    },
+    EditPreamble {
+        source: String,
+    },
+    EditMarkdown {
+        name: String,
+        content: String,
+    },
     /// Append or insert after an existing item.
     AddItem {
         kind: String,
@@ -35,8 +49,12 @@ pub enum ClientMessage {
         name: String,
         direction: String,
     },
-    RunCell { name: String },
-    SetAuto { enabled: bool },
+    RunCell {
+        name: String,
+    },
+    SetAuto {
+        enabled: bool,
+    },
     RunAll,
     Reload,
 }

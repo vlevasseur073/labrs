@@ -59,6 +59,11 @@ pub fn report(val: &u16) -> String {
     let double_val = double(*val);
     let msg = format!("Double of {val} is {double_val}");
     println!("{msg}");
+    let msg2 = String::from("A string literal");
+    println!("{msg2}");
+    let msg3 = "Another string literal, ok".split(",");
+    let msg3 = msg3.collect::<Vec<_>>();
+    println!("{:?}", msg3);
     msg
 }
 

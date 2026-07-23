@@ -13,7 +13,7 @@ labrs sits in the same space as Pluto / marimo, adapted to Rust: cells are named
 - **Session** — dirty tracking, Auto-run cascade, edit/reload of cells, helpers, structures, and preamble
 - **CLI** — `new`, `graph`, `run`, `fmt`, `edit`
 - **Web server** — Axum + WebSocket (`labrs-server`)
-- **Editor UI** — Monaco (embedded HTML/CSS/JS), Notebook / Shared panes, Inspector + Plan sidebar
+- **Editor UI** — Monaco + rust-analyzer LSP (completion / hover / diagnostics), Notebook / Shared panes, Inspector + Plan sidebar
 
 ## Quick start
 
@@ -229,6 +229,16 @@ labrs edit notebook.rs
 - **Reload** — re-parse the file from disk.
 
 Monaco editors strip `#[labrs::…]` attributes in the UI and restore them when writing back to the `.rs` file.
+
+### Code intelligence (rust-analyzer)
+
+With `rust-analyzer` on your `PATH` (e.g. `rustup component add rust-analyzer`), the editor UI opens a WebSocket LSP proxy at `/lsp` and wires Monaco for:
+
+- Completions (trigger on `.` `:` `<`, or Ctrl+Space)
+- Hover docs
+- Diagnostics as Monaco markers on the relevant cell / shared editor
+
+The server uses the notebook directory’s `Cargo.toml` when it is a standalone package. Notebooks that live inside another Cargo workspace (for example `examples/demo.rs` in this repo) get an isolated scratch package under `.labrs/lsp/` with its own `[workspace]` — otherwise Cargo refuses to load the crate and rust-analyzer cannot resolve `std`.
 
 ---
 

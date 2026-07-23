@@ -1,5 +1,6 @@
 //! Web server for the labrs notebook UI.
 
+mod lsp;
 mod protocol;
 mod static_files;
 
@@ -10,6 +11,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+use futures_util::StreamExt;
 use labrs_core::fmt::rustfmt_cell_source;
 use labrs_core::graph::transitive_dependents;
 use labrs_core::{strip_labrs_attrs, with_labrs_attr, AddKind, MoveDirection, Session};
@@ -63,6 +65,7 @@ pub async fn serve_with_options(file: Option<PathBuf>, port: u16, auto_react: bo
         .route("/app.js", get(static_files::app_js))
         .route("/app.css", get(static_files::app_css))
         .route("/ws", get(ws_handler))
+        .route("/lsp", get(lsp_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -75,6 +78,31 @@ pub async fn serve_with_options(file: Option<PathBuf>, port: u16, auto_react: bo
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn lsp_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let path = {
+            let guard = state.session.lock().await;
+            guard.as_ref().map(|s| s.path.clone())
+        };
+        match path {
+            Some(path) => lsp::handle_lsp_websocket(socket, path).await,
+            None => {
+                use futures_util::SinkExt;
+                let (mut sender, _recv) = socket.split();
+                let msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "window/showMessage",
+                    "params": {
+                        "type": 2,
+                        "message": "Open a notebook to enable rust-analyzer."
+                    }
+                });
+                let _ = sender.send(Message::Text(msg.to_string().into())).await;
+            }
+        }
+    })
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
@@ -606,6 +634,8 @@ async fn run_dirty_streaming(
 }
 
 fn full_state(session: &Session) -> ServerMessage {
+    let (lsp_root, lsp_document) = lsp::lsp_paths(&session.path);
+    lsp::sync_scratch_notebook(&session.path, &session.notebook.source);
     ServerMessage::NotebookState {
         snapshot: session.snapshot(),
         notebook_source: session.notebook.source.clone(),
@@ -626,6 +656,7 @@ fn full_state(session: &Session) -> ServerMessage {
                         ty: p.ty.clone(),
                     })
                     .collect(),
+                span: c.span,
             })
             .collect(),
         helpers_detail: session
@@ -636,6 +667,7 @@ fn full_state(session: &Session) -> ServerMessage {
                 name: h.name.clone(),
                 source: strip_labrs_attrs(&h.source),
                 docs: h.docs.clone(),
+                span: h.span,
             })
             .collect(),
         markdown_detail: session
@@ -646,6 +678,7 @@ fn full_state(session: &Session) -> ServerMessage {
                 name: m.name.clone(),
                 content: m.content.clone(),
                 source: m.source.clone(),
+                span: m.span,
             })
             .collect(),
         definitions_detail: session
@@ -656,8 +689,11 @@ fn full_state(session: &Session) -> ServerMessage {
                 name: d.name.clone(),
                 kind: d.kind.clone(),
                 source: d.source.clone(),
+                span: d.span,
             })
             .collect(),
+        lsp_root: lsp_root.display().to_string(),
+        lsp_document: lsp_document.display().to_string(),
     }
 }
 

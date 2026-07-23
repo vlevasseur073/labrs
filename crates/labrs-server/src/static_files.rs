@@ -633,9 +633,99 @@ body.split-layout .inspector {
   background: var(--accent); color: white; border-color: var(--accent);
 }
 .footer-add button .plus-mark { margin-right: 0.35rem; font-weight: 700; }
+
+/* Monaco hover + completion: escape cell clipping, larger panels, real scroll */
+.monaco-editor .overflowingContentWidgets {
+  z-index: 100;
+}
+.monaco-editor .suggest-widget,
+.editor-widget.suggest-widget {
+  z-index: 40 !important;
+  width: min(40rem, 92vw) !important;
+  max-width: 92vw !important;
+  border: 1px solid var(--border-strong) !important;
+  border-radius: 10px !important;
+  box-shadow: var(--shadow) !important;
+  background: var(--surface) !important;
+}
+.monaco-editor .suggest-widget .monaco-list,
+.editor-widget.suggest-widget .monaco-list {
+  max-height: min(22rem, 55vh) !important;
+}
+.monaco-editor .suggest-widget .monaco-list .monaco-scrollable-element,
+.editor-widget.suggest-widget .monaco-list .monaco-scrollable-element {
+  max-height: min(22rem, 55vh) !important;
+}
+.monaco-editor .suggest-widget .monaco-list-rows .monaco-list-row,
+.editor-widget.suggest-widget .monaco-list-rows .monaco-list-row {
+  padding: 0.2rem 0.35rem;
+}
+.monaco-editor .suggest-details,
+.editor-widget.suggest-details {
+  max-width: min(28rem, 90vw) !important;
+  max-height: min(24rem, 55vh) !important;
+  border-radius: 10px !important;
+  border: 1px solid var(--border-strong) !important;
+  box-shadow: var(--shadow) !important;
+  background: var(--surface) !important;
+  overflow: auto !important;
+}
+.monaco-editor .suggest-details .monaco-scrollable-element,
+.editor-widget.suggest-details .monaco-scrollable-element {
+  max-height: min(24rem, 55vh) !important;
+}
+.monaco-hover,
+.monaco-editor .monaco-hover {
+  z-index: 50 !important;
+  max-width: min(42rem, 92vw) !important;
+  max-height: min(28rem, 70vh) !important;
+  border: 1px solid var(--border-strong) !important;
+  border-radius: 10px !important;
+  box-shadow: var(--shadow) !important;
+  background: var(--surface) !important;
+  color: var(--ink) !important;
+}
+.monaco-hover .monaco-hover-content,
+.monaco-editor .monaco-hover .monaco-hover-content {
+  max-width: min(42rem, 92vw) !important;
+  max-height: min(26rem, 65vh) !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  padding: 0.55rem 0.75rem !important;
+  scrollbar-gutter: stable;
+}
+.monaco-hover .hover-contents,
+.monaco-editor .monaco-hover .hover-contents {
+  max-width: 100% !important;
+  font-size: 0.86rem !important;
+  line-height: 1.45 !important;
+  word-break: break-word;
+}
+.monaco-hover .hover-contents .code,
+.monaco-hover .hover-contents pre,
+.monaco-hover .hover-contents code {
+  font-family: var(--mono) !important;
+  font-size: 0.82rem !important;
+  white-space: pre-wrap !important;
+  word-break: break-word;
+}
+.monaco-hover .markdown-hover,
+.monaco-hover .hover-row {
+  max-width: 100%;
+}
+.monaco-editor .parameter-hints-widget {
+  z-index: 45 !important;
+  max-width: min(36rem, 90vw) !important;
+  max-height: min(16rem, 40vh) !important;
+  overflow: auto !important;
+  border-radius: 10px !important;
+  border: 1px solid var(--border-strong) !important;
+  box-shadow: var(--shadow) !important;
+  background: var(--surface) !important;
+}
 "#;
 
-const APP_JS: &str = r#"
+const APP_JS: &str = r##"
 (() => {
   const notebookEl = document.getElementById("notebook");
   const sharedEl = document.getElementById("shared");
@@ -845,6 +935,7 @@ const APP_JS: &str = r#"
         document.body.classList.remove("split-layout");
         setAppMode("welcome");
         renderWelcome();
+        disconnectLsp();
         break;
       case "dir_listing":
         if (welcomeState) {
@@ -863,6 +954,8 @@ const APP_JS: &str = r#"
         }
         setAppMode("notebook");
         render();
+        ensureLspConnected();
+        scheduleLspSync();
         break;
       case "cell_formatted":
       case "helper_formatted": {
@@ -1423,12 +1516,28 @@ const APP_JS: &str = r#"
       padding: { top: 8, bottom: 8 },
       readOnly: !!readOnly,
       domReadOnly: !!readOnly,
+      // Render hover/suggest outside the tiny cell editor so they are not clipped.
+      fixedOverflowWidgets: true,
+      suggestFontSize: 13,
+      suggestLineHeight: 24,
+      hover: { enabled: true, delay: 280, sticky: true },
+      suggest: {
+        showStatusBar: true,
+        preview: true,
+        shareSuggestSelections: true,
+        snippetsPreventQuickSuggestions: false,
+      },
     });
     if (sel) editor.setSelection(sel);
     if (onSaveCmd && !readOnly) {
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, onSaveCmd);
     }
     editors.set(key, editor);
+    if ((language || "rust") === "rust") {
+      editor.onDidChangeModelContent(() => {
+        if (typeof scheduleLspSync === "function") scheduleLspSync();
+      });
+    }
     return editor;
   }
 
@@ -2045,6 +2154,696 @@ const APP_JS: &str = r#"
     }
   })();
 
-  require(["vs/editor/editor.main"], () => connect());
+  // --- rust-analyzer LSP client (WebSocket proxy at /lsp) ---
+  const lspState = {
+    ws: null,
+    connected: false,
+    initialized: false,
+    pending: new Map(),
+    requestId: 0,
+    documentVersion: 0,
+    documentOpen: false,
+    syncTimer: null,
+    providersRegistered: false,
+    docPath: null,
+  };
+
+  function pathToFileUri(p) {
+    if (!p) return "";
+    let path = String(p).replace(/\\/g, "/");
+    if (!path.startsWith("/")) path = "/" + path;
+    return "file://" + path;
+  }
+
+  function lspDocUri() {
+    return state && state.lsp_document ? pathToFileUri(state.lsp_document) : "";
+  }
+
+  function lspRootUri() {
+    return state && state.lsp_root ? pathToFileUri(state.lsp_root) : "";
+  }
+
+  function stripLabrsAttrsJs(source) {
+    return String(source || "")
+      .split("\n")
+      .filter((l) => {
+        const t = l.trim();
+        return !(
+          t.startsWith("#[labrs::") ||
+          t.startsWith("#[labrs_macros::") ||
+          t === "#[cell]" ||
+          t === "#[helper]" ||
+          t === "#[markdown]"
+        );
+      })
+      .join("\n")
+      .trim();
+  }
+
+  function isLabrsAttrLine(line) {
+    const t = String(line || "").trim();
+    return (
+      t.startsWith("#[labrs::") ||
+      t.startsWith("#[labrs_macros::") ||
+      t === "#[cell]" ||
+      t === "#[helper]" ||
+      t === "#[markdown]"
+    );
+  }
+
+  /** Map offset in stripped editor text → offset in full item source (with attrs). */
+  function strippedOffsetToFull(fullItem, strippedOffset) {
+    let full = 0;
+    let stripped = 0;
+    const lines = String(fullItem || "").split("\n");
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li];
+      const lineWithNl = line + (li < lines.length - 1 ? "\n" : "");
+      if (isLabrsAttrLine(line)) {
+        full += lineWithNl.length;
+        continue;
+      }
+      for (let i = 0; i < lineWithNl.length; i++) {
+        if (stripped >= strippedOffset) return full;
+        full++;
+        stripped++;
+      }
+    }
+    return full;
+  }
+
+  /** Map offset in full item → offset in stripped editor text. */
+  function fullOffsetToStripped(fullItem, fullOffset) {
+    let full = 0;
+    let stripped = 0;
+    const lines = String(fullItem || "").split("\n");
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li];
+      const lineWithNl = line + (li < lines.length - 1 ? "\n" : "");
+      if (isLabrsAttrLine(line)) {
+        full += lineWithNl.length;
+        continue;
+      }
+      for (let i = 0; i < lineWithNl.length; i++) {
+        if (full >= fullOffset) return stripped;
+        full++;
+        stripped++;
+      }
+    }
+    return stripped;
+  }
+
+  function offsetToLspPos(text, offset) {
+    let line = 0;
+    let character = 0;
+    const n = Math.max(0, Math.min(offset, text.length));
+    for (let i = 0; i < n; i++) {
+      if (text[i] === "\n") {
+        line++;
+        character = 0;
+      } else {
+        character++;
+      }
+    }
+    return { line, character };
+  }
+
+  function lspPosToOffset(text, line, character) {
+    let lineNo = 0;
+    let i = 0;
+    while (i < text.length && lineNo < line) {
+      if (text[i] === "\n") lineNo++;
+      i++;
+    }
+    return Math.min(text.length, i + Math.max(0, character));
+  }
+
+  function withLabrsAttrJs(source, attr) {
+    // Preserve editor text exactly (no trim) so live offsets match Monaco.
+    const marker = "#[labrs::" + attr + "]";
+    const lines = String(source || "")
+      .split("\n")
+      .filter((l) => !isLabrsAttrLine(l));
+    let insertAt = 0;
+    while (insertAt < lines.length) {
+      const t = lines[insertAt].trim();
+      if (!t || t.startsWith("///") || t.startsWith("//!")) insertAt++;
+      else break;
+    }
+    lines.splice(insertAt, 0, marker);
+    let out = lines.join("\n");
+    if (!out.endsWith("\n")) out += "\n";
+    return out;
+  }
+
+  function ensureTrailingNl(text) {
+    if (!text) return "\n";
+    return text.endsWith("\n") ? text : text + "\n";
+  }
+
+  /**
+   * Rebuild the LSP document from notebook_source, splicing in live Monaco
+   * buffers. Returns text plus up-to-date byte ranges per editor key so
+   * completion/hover positions match what the user is typing (not last save).
+   */
+  function buildLiveLspDocument() {
+    const src = (state && state.notebook_source) || "";
+    const ranges = new Map();
+    if (!src) return { text: "", ranges };
+
+    const items = [];
+    for (const c of state.cells_detail || []) {
+      if (!c.span) continue;
+      const ed = editors.get(c.name);
+      const live = ed
+        ? withLabrsAttrJs(ed.getValue(), "cell")
+        : ensureTrailingNl(src.slice(c.span[0], c.span[1]));
+      items.push({
+        key: c.name,
+        start: c.span[0],
+        end: c.span[1],
+        liveText: live,
+        stripAttrs: true,
+      });
+    }
+    for (const h of state.helpers_detail || []) {
+      if (!h.span) continue;
+      const key = "helper:" + h.name;
+      const ed = editors.get(key);
+      const live = ed
+        ? ensureTrailingNl(ed.getValue())
+        : ensureTrailingNl(src.slice(h.span[0], h.span[1]));
+      items.push({ key, start: h.span[0], end: h.span[1], liveText: live, stripAttrs: false });
+    }
+    for (const d of state.definitions_detail || []) {
+      if (!d.span) continue;
+      const key = "def:" + d.name;
+      // Combined preamble editor replaces individual use/item defs when present.
+      if ((d.kind === "use" || d.kind === "item") && editors.has("def:__preamble__")) {
+        continue;
+      }
+      const ed = editors.get(key);
+      const live = ed
+        ? ensureTrailingNl(ed.getValue())
+        : ensureTrailingNl(src.slice(d.span[0], d.span[1]));
+      items.push({ key, start: d.span[0], end: d.span[1], liveText: live, stripAttrs: false });
+    }
+
+    // If preamble editor is open, replace the contiguous use/item span range.
+    const preambleEd = editors.get("def:__preamble__");
+    if (preambleEd) {
+      const others = (state.definitions_detail || []).filter(
+        (d) => d.kind === "use" || d.kind === "item"
+      );
+      if (others.length) {
+        const start = Math.min(...others.map((d) => d.span[0]));
+        const end = Math.max(...others.map((d) => d.span[1]));
+        items.push({
+          key: "def:__preamble__",
+          start,
+          end,
+          liveText: ensureTrailingNl(preambleEd.getValue()),
+          stripAttrs: false,
+        });
+      }
+    }
+
+    items.sort((a, b) => a.start - b.start || a.end - b.end);
+    // Drop overlapping items (keep first)
+    const filtered = [];
+    let lastEnd = -1;
+    for (const it of items) {
+      if (it.start < lastEnd) continue;
+      filtered.push(it);
+      lastEnd = it.end;
+    }
+
+    let out = "";
+    let cursor = 0;
+    for (const it of filtered) {
+      if (it.start < cursor) continue;
+      out += src.slice(cursor, it.start);
+      const start = out.length;
+      out += it.liveText;
+      ranges.set(it.key, {
+        start,
+        end: out.length,
+        stripAttrs: it.stripAttrs,
+        fullItem: it.liveText,
+      });
+      cursor = it.end;
+    }
+    out += src.slice(cursor);
+    return { text: out, ranges };
+  }
+
+  function getLspDocumentText() {
+    return buildLiveLspDocument().text;
+  }
+
+  function cellToGlobalPosition(editorKey, line, character) {
+    const { text, ranges } = buildLiveLspDocument();
+    const r = ranges.get(editorKey);
+    if (!r || !text) return null;
+    const ed = editors.get(editorKey);
+    const edText = ed
+      ? ed.getValue()
+      : r.stripAttrs
+        ? stripLabrsAttrsJs(r.fullItem)
+        : r.fullItem.replace(/\n$/, "");
+    const edOffset = lspPosToOffset(edText, line, character);
+    let fullItemOffset = edOffset;
+    if (r.stripAttrs) {
+      fullItemOffset = strippedOffsetToFull(r.fullItem, edOffset);
+    }
+    fullItemOffset = Math.max(0, Math.min(fullItemOffset, r.fullItem.length));
+    return offsetToLspPos(text, r.start + fullItemOffset);
+  }
+
+  function globalToCellPosition(globalLine, character) {
+    const { text, ranges } = buildLiveLspDocument();
+    if (!text) return null;
+    const abs = lspPosToOffset(text, globalLine, character);
+    for (const [key, r] of ranges) {
+      if (abs >= r.start && abs < r.end) {
+        const localFull = abs - r.start;
+        let localStripped = localFull;
+        if (r.stripAttrs) localStripped = fullOffsetToStripped(r.fullItem, localFull);
+        const ed = editors.get(key);
+        const edText = ed
+          ? ed.getValue()
+          : r.stripAttrs
+            ? stripLabrsAttrsJs(r.fullItem)
+            : r.fullItem.replace(/\n$/, "");
+        const pos = offsetToLspPos(edText, localStripped);
+        return { key, line: pos.line, character: pos.character };
+      }
+    }
+    return null;
+  }
+
+  function flushLspSync() {
+    if (lspState.syncTimer) {
+      clearTimeout(lspState.syncTimer);
+      lspState.syncTimer = null;
+    }
+    if (!state || !lspState.initialized) return;
+    if (!lspState.documentOpen) openLspDocument();
+    else notifyLspDocumentChange();
+  }
+
+  function sendLspRequest(method, params) {
+    return new Promise((resolve, reject) => {
+      if (!lspState.connected || !lspState.ws) {
+        reject(new Error("LSP not connected"));
+        return;
+      }
+      const id = ++lspState.requestId;
+      lspState.pending.set(id, { resolve, reject });
+      lspState.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      setTimeout(() => {
+        if (lspState.pending.has(id)) {
+          lspState.pending.delete(id);
+          reject(new Error("LSP request timeout"));
+        }
+      }, 15000);
+    });
+  }
+
+  function sendLspNotification(method, params) {
+    if (!lspState.connected || !lspState.ws) return;
+    lspState.ws.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
+  }
+
+  function replyLsp(id, result) {
+    if (!lspState.connected || !lspState.ws) return;
+    lspState.ws.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
+  }
+
+  function handleLspServerRequest(msg) {
+    const method = msg.method;
+    const id = msg.id;
+    if (method === "workspace/configuration") {
+      const items = (msg.params && msg.params.items) || [];
+      replyLsp(id, items.map(() => ({
+        checkOnSave: false,
+        cargo: { buildScripts: { enable: false } },
+        procMacro: { enable: true },
+      })));
+      return;
+    }
+    if (method === "window/workDoneProgress/create" || method === "client/registerCapability") {
+      replyLsp(id, null);
+      return;
+    }
+    if (method === "workspace/workspaceFolders") {
+      const root = lspRootUri();
+      replyLsp(id, root ? [{ uri: root, name: "labrs" }] : null);
+      return;
+    }
+    replyLsp(id, null);
+  }
+
+  function mapDiagnosticSeverity(severity) {
+    switch (severity) {
+      case 1: return monaco.MarkerSeverity.Error;
+      case 2: return monaco.MarkerSeverity.Warning;
+      case 3: return monaco.MarkerSeverity.Info;
+      case 4: return monaco.MarkerSeverity.Hint;
+      default: return monaco.MarkerSeverity.Info;
+    }
+  }
+
+  function handleLspDiagnostics(params) {
+    if (!params || params.uri !== lspDocUri()) return;
+    if (typeof monaco === "undefined") return;
+    const byKey = new Map();
+    for (const d of params.diagnostics || []) {
+      const start = globalToCellPosition(d.range.start.line, d.range.start.character);
+      if (!start || !start.key || start.key === "__file__") continue;
+      let endLine = start.line;
+      let endChar = start.character + 1;
+      const end = globalToCellPosition(d.range.end.line, d.range.end.character);
+      if (end && end.key === start.key) {
+        endLine = end.line;
+        endChar = Math.max(end.character, start.character + 1);
+      }
+      if (!byKey.has(start.key)) byKey.set(start.key, []);
+      byKey.get(start.key).push({
+        severity: mapDiagnosticSeverity(d.severity),
+        message: d.message,
+        startLineNumber: start.line + 1,
+        startColumn: start.character + 1,
+        endLineNumber: endLine + 1,
+        endColumn: endChar + 1,
+        source: d.source || "rust-analyzer",
+      });
+    }
+    editors.forEach((ed, key) => {
+      const model = ed.getModel && ed.getModel();
+      if (!model) return;
+      monaco.editor.setModelMarkers(model, "rust-analyzer", byKey.get(key) || []);
+    });
+  }
+
+  function handleLspMessage(msg) {
+    if (msg.id !== undefined && msg.method) {
+      handleLspServerRequest(msg);
+      return;
+    }
+    if (msg.id !== undefined && lspState.pending.has(msg.id)) {
+      const { resolve, reject } = lspState.pending.get(msg.id);
+      lspState.pending.delete(msg.id);
+      if (msg.error) reject(new Error(msg.error.message || "LSP error"));
+      else resolve(msg.result);
+      return;
+    }
+    if (msg.method === "textDocument/publishDiagnostics") {
+      handleLspDiagnostics(msg.params);
+    } else if (msg.method === "window/showMessage" && msg.params) {
+      console.warn("[LSP]", msg.params.message);
+    }
+  }
+
+  async function initializeLsp() {
+    const root = lspRootUri();
+    const doc = lspDocUri();
+    if (!root || !doc) return;
+    try {
+      await sendLspRequest("initialize", {
+        processId: null,
+        clientInfo: { name: "labrs", version: "0.1.0" },
+        rootUri: root,
+        workspaceFolders: [{ uri: root, name: "labrs" }],
+        capabilities: {
+          workspace: { configuration: true, workspaceFolders: true },
+          textDocument: {
+            synchronization: { didSave: true },
+            completion: {
+              completionItem: {
+                snippetSupport: true,
+                documentationFormat: ["markdown", "plaintext"],
+              },
+            },
+            hover: { contentFormat: ["markdown", "plaintext"] },
+            publishDiagnostics: { relatedInformation: true },
+          },
+        },
+        initializationOptions: {
+          checkOnSave: false,
+          cargo: { buildScripts: { enable: false } },
+          procMacro: { enable: false },
+        },
+      });
+      lspState.initialized = true;
+      sendLspNotification("initialized", {});
+      openLspDocument();
+    } catch (e) {
+      console.error("[LSP] initialize failed", e);
+    }
+  }
+
+  function openLspDocument() {
+    const uri = lspDocUri();
+    if (!uri || !lspState.initialized) return;
+    lspState.documentVersion += 1;
+    sendLspNotification("textDocument/didOpen", {
+      textDocument: {
+        uri,
+        languageId: "rust",
+        version: lspState.documentVersion,
+        text: getLspDocumentText(),
+      },
+    });
+    lspState.documentOpen = true;
+  }
+
+  function notifyLspDocumentChange() {
+    const uri = lspDocUri();
+    if (!uri || !lspState.initialized || !lspState.documentOpen) return;
+    lspState.documentVersion += 1;
+    sendLspNotification("textDocument/didChange", {
+      textDocument: { uri, version: lspState.documentVersion },
+      contentChanges: [{ text: getLspDocumentText() }],
+    });
+  }
+
+  function scheduleLspSync() {
+    if (lspState.syncTimer) clearTimeout(lspState.syncTimer);
+    lspState.syncTimer = setTimeout(() => {
+      if (!state) return;
+      if (!lspState.initialized) {
+        ensureLspConnected();
+        return;
+      }
+      if (!lspState.documentOpen) openLspDocument();
+      else notifyLspDocumentChange();
+    }, 350);
+  }
+
+  function disconnectLsp() {
+    if (lspState.syncTimer) clearTimeout(lspState.syncTimer);
+    lspState.syncTimer = null;
+    lspState.initialized = false;
+    lspState.documentOpen = false;
+    lspState.docPath = null;
+    lspState.pending.forEach(({ reject }) => reject(new Error("LSP disconnected")));
+    lspState.pending.clear();
+    if (lspState.ws) {
+      try { lspState.ws.close(); } catch (_) {}
+      lspState.ws = null;
+    }
+    lspState.connected = false;
+    if (typeof monaco !== "undefined") {
+      editors.forEach((ed) => {
+        const model = ed.getModel && ed.getModel();
+        if (model) monaco.editor.setModelMarkers(model, "rust-analyzer", []);
+      });
+    }
+  }
+
+  function ensureLspConnected() {
+    if (!state || !state.lsp_document) return;
+    if (lspState.docPath && lspState.docPath !== state.lsp_document) {
+      disconnectLsp();
+    }
+    lspState.docPath = state.lsp_document;
+    if (lspState.ws && (lspState.connected || lspState.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(proto + "://" + location.host + "/lsp");
+    lspState.ws = socket;
+    socket.onopen = () => {
+      lspState.connected = true;
+      initializeLsp();
+    };
+    socket.onmessage = (ev) => {
+      try { handleLspMessage(JSON.parse(ev.data)); }
+      catch (e) { console.error("[LSP] bad message", e); }
+    };
+    socket.onclose = () => {
+      lspState.connected = false;
+      lspState.initialized = false;
+      lspState.documentOpen = false;
+      lspState.ws = null;
+      if (state) setTimeout(ensureLspConnected, 4000);
+    };
+    socket.onerror = () => { console.warn("[LSP] WebSocket error"); };
+  }
+
+  function mapCompletionKind(kind) {
+    const K = monaco.languages.CompletionItemKind;
+    const mapping = {
+      1: K.Text, 2: K.Method, 3: K.Function, 4: K.Constructor, 5: K.Field,
+      6: K.Variable, 7: K.Class, 8: K.Interface, 9: K.Module, 10: K.Property,
+      11: K.Unit, 12: K.Value, 13: K.Enum, 14: K.Keyword, 15: K.Snippet,
+      16: K.Color, 17: K.File, 18: K.Reference, 19: K.Folder, 20: K.EnumMember,
+      21: K.Constant, 22: K.Struct, 23: K.Event, 24: K.Operator, 25: K.TypeParameter,
+    };
+    return mapping[kind] || K.Text;
+  }
+
+  function editorKeyFromModel(model) {
+    for (const [key, ed] of editors) {
+      if (ed.getModel && ed.getModel() === model) return key;
+    }
+    return null;
+  }
+
+  async function requestCompletions(editorKey, line, character) {
+    if (!lspState.initialized) return [];
+    flushLspSync();
+    const globalPos = cellToGlobalPosition(editorKey, line, character);
+    if (!globalPos) return [];
+    try {
+      const result = await sendLspRequest("textDocument/completion", {
+        textDocument: { uri: lspDocUri() },
+        position: { line: globalPos.line, character: globalPos.character },
+      });
+      if (!result) return [];
+      const items = result.items || result;
+      return items.map((item) => {
+        const label =
+          typeof item.label === "string"
+            ? item.label
+            : (item.label && item.label.label) || "";
+        const detail =
+          item.detail ||
+          (item.label && typeof item.label === "object" && item.label.detail) ||
+          "";
+        return {
+          label,
+          kind: item.kind,
+          detail,
+          documentation: item.documentation,
+          insertText: item.insertText || label,
+          filterText: item.filterText || label,
+          insertTextRules:
+            item.insertTextFormat === 2
+              ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
+              : undefined,
+        };
+      });
+    } catch (e) {
+      console.debug("[LSP] completion failed", e);
+      return [];
+    }
+  }
+
+  async function requestHover(editorKey, line, character) {
+    if (!lspState.initialized) return null;
+    flushLspSync();
+    const globalPos = cellToGlobalPosition(editorKey, line, character);
+    if (!globalPos) return null;
+    try {
+      const result = await sendLspRequest("textDocument/hover", {
+        textDocument: { uri: lspDocUri() },
+        position: { line: globalPos.line, character: globalPos.character },
+      });
+      if (!result || !result.contents) return null;
+      let contents = result.contents;
+      if (typeof contents === "string") contents = [{ value: contents }];
+      else if (contents.value) contents = [contents];
+      else if (!Array.isArray(contents)) contents = [contents];
+      return {
+        contents: contents.map((c) => {
+          if (typeof c === "string") return { value: c };
+          if (c && c.value) {
+            // MarkedString { language, value } → fenced block for Monaco
+            if (c.language) {
+              return { value: "```" + c.language + "\n" + c.value + "\n```" };
+            }
+            return { value: c.value };
+          }
+          return { value: "" };
+        }).filter((c) => c.value),
+      };
+    } catch (e) {
+      console.debug("[LSP] hover failed", e);
+      return null;
+    }
+  }
+
+  function registerMonacoLspProviders() {
+    if (lspState.providersRegistered || typeof monaco === "undefined") return;
+    lspState.providersRegistered = true;
+
+    monaco.languages.registerCompletionItemProvider("rust", {
+      triggerCharacters: [".", ":", "<"],
+      provideCompletionItems: async (model, position) => {
+        const key = editorKeyFromModel(model);
+        if (!key) return { suggestions: [] };
+        const word = model.getWordUntilPosition(position);
+        const replaceRange = {
+          startLineNumber: position.lineNumber,
+          startColumn: word.startColumn,
+          endLineNumber: position.lineNumber,
+          endColumn: position.column,
+        };
+        const suggestions = await requestCompletions(
+          key,
+          position.lineNumber - 1,
+          position.column - 1
+        );
+        return {
+          suggestions: suggestions.map((s, i) => {
+            let documentation = s.documentation;
+            if (documentation && typeof documentation === "object" && documentation.value) {
+              documentation = { value: documentation.value };
+            } else if (typeof documentation === "string") {
+              documentation = { value: documentation };
+            }
+            return {
+              label: s.label,
+              kind: mapCompletionKind(s.kind),
+              detail: s.detail || "",
+              documentation,
+              insertText: s.insertText,
+              filterText: s.filterText || s.label,
+              insertTextRules: s.insertTextRules,
+              range: replaceRange,
+              sortText: String(i).padStart(5, "0"),
+            };
+          }),
+        };
+      },
+    });
+
+    monaco.languages.registerHoverProvider("rust", {
+      provideHover: async (model, position) => {
+        const key = editorKeyFromModel(model);
+        if (!key) return null;
+        const hover = await requestHover(key, position.lineNumber - 1, position.column - 1);
+        if (!hover || !hover.contents.length) return null;
+        return { contents: hover.contents.map((c) => ({ value: c.value })) };
+      },
+    });
+  }
+
+  require(["vs/editor/editor.main"], () => {
+    registerMonacoLspProviders();
+    connect();
+  });
 })();
-"#;
+"##;

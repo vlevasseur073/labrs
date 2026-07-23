@@ -44,9 +44,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       <button id="btn-toggle-inspector" class="icon menu-btn" type="button" title="Toggle inspector" aria-label="Toggle inspector" aria-controls="inspector" aria-expanded="true">
         <span class="menu-icon" aria-hidden="true"></span>
       </button>
-      <div class="brand">labrs</div>
+      <button type="button" class="brand brand-btn" id="btn-home" title="Home / files">labrs</button>
     </div>
-    <div class="actions">
+    <div class="actions" id="notebook-actions">
       <label class="auto-toggle" title="Automatically re-run dependent cells when an upstream output changes">
         <input type="checkbox" id="chk-auto" checked />
         Auto-run
@@ -56,7 +56,27 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       <span id="conn" class="conn">connecting…</span>
     </div>
   </header>
-  <div class="workspace">
+  <div id="welcome" class="welcome hidden">
+    <aside class="file-browser" aria-label="Files">
+      <div class="file-browser-head">
+        <div class="file-browser-title">Files</div>
+        <div id="file-cwd" class="file-cwd"></div>
+      </div>
+      <div id="file-list" class="file-list"></div>
+    </aside>
+    <main class="welcome-main">
+      <div class="welcome-hero">
+        <div class="welcome-brand">labrs</div>
+        <h1 class="welcome-title">Open a notebook</h1>
+        <p class="welcome-sub">Browse <code>.rs</code> files on the left, or create a new reactive notebook.</p>
+        <div class="welcome-actions">
+          <button type="button" class="primary" id="btn-new-notebook">New notebook</button>
+        </div>
+        <p class="welcome-hint">Root: <span id="welcome-root"></span></p>
+      </div>
+    </main>
+  </div>
+  <div class="workspace" id="workspace">
     <aside id="inspector" class="inspector" aria-label="Sidebar"></aside>
     <div class="workspace-main">
       <aside id="diag" class="diag hidden"></aside>
@@ -136,6 +156,66 @@ body.split-layout .workspace {
 }
 .brand-wrap { display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
 .brand { font-weight: 700; letter-spacing: -0.04em; font-size: 1.3rem; color: var(--accent); }
+.brand-btn {
+  font: inherit; font-weight: 700; letter-spacing: -0.04em; font-size: 1.3rem; color: var(--accent);
+  border: none; background: transparent; padding: 0; cursor: pointer;
+}
+.brand-btn:hover { filter: brightness(0.92); }
+.welcome {
+  display: grid;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+  min-height: calc(100vh - 3.5rem);
+  align-items: stretch;
+}
+.welcome.hidden { display: none; }
+body.welcome-mode .workspace { display: none !important; }
+body.welcome-mode .menu-btn { display: none; }
+body.welcome-mode #notebook-actions .auto-toggle,
+body.welcome-mode #btn-run-all,
+body.welcome-mode #btn-reload { display: none; }
+body:not(.welcome-mode) #welcome { display: none !important; }
+.file-browser {
+  border-right: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  backdrop-filter: blur(8px);
+  padding: 1rem 0.85rem 2rem;
+  overflow: auto;
+}
+.file-browser-head { margin-bottom: 0.75rem; padding: 0 0.25rem; }
+.file-browser-title {
+  font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--muted); font-weight: 700;
+}
+.file-cwd {
+  margin-top: 0.25rem; font-family: var(--mono); font-size: 0.72rem; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.file-list { display: flex; flex-direction: column; gap: 0.2rem; }
+.file-item {
+  display: flex; align-items: center; gap: 0.45rem; width: 100%; text-align: left;
+  border: 1px solid transparent; background: transparent; border-radius: 8px;
+  padding: 0.45rem 0.55rem; cursor: pointer; color: inherit; font: inherit;
+}
+.file-item:hover { background: var(--surface); border-color: var(--border); }
+.file-item .file-icon { color: var(--muted); font-size: 0.85rem; width: 1.1rem; text-align: center; }
+.file-item.notebook .file-icon { color: var(--accent); }
+.file-item .file-name {
+  font-family: var(--mono); font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.welcome-main {
+  display: flex; align-items: center; justify-content: center; padding: 2rem 1.5rem;
+}
+.welcome-hero { max-width: 28rem; text-align: left; }
+.welcome-brand {
+  font-weight: 700; letter-spacing: -0.04em; font-size: 2rem; color: var(--accent); margin-bottom: 0.75rem;
+}
+.welcome-title {
+  margin: 0 0 0.55rem; font-size: 1.55rem; letter-spacing: -0.03em; font-weight: 650;
+}
+.welcome-sub { margin: 0 0 1.25rem; color: var(--muted); line-height: 1.5; }
+.welcome-sub code { font-family: var(--mono); font-size: 0.9em; }
+.welcome-actions { display: flex; gap: 0.55rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+.welcome-hint { margin: 0; font-size: 0.78rem; color: var(--muted); font-family: var(--mono); word-break: break-all; }
 .menu-btn {
   width: 2.15rem; height: 2.15rem; color: var(--accent);
   border: 1px solid transparent; background: transparent;
@@ -566,6 +646,7 @@ const APP_JS: &str = r#"
   const connEl = document.getElementById("conn");
   const editors = new Map();
   let state = null;
+  let welcomeState = null;
   let ws;
   const mdEditing = new Set();
   let openInsertKey = null;
@@ -757,13 +838,30 @@ const APP_JS: &str = r#"
 
   function handleServer(msg) {
     switch (msg.type) {
+      case "welcome":
+        welcomeState = msg;
+        state = null;
+        runningCells.clear();
+        document.body.classList.remove("split-layout");
+        setAppMode("welcome");
+        renderWelcome();
+        break;
+      case "dir_listing":
+        if (welcomeState) {
+          welcomeState.cwd = msg.path;
+          welcomeState.entries = msg.entries;
+          renderWelcome();
+        }
+        break;
       case "notebook_state":
         state = msg;
+        welcomeState = null;
         runningCells.clear();
         const autoEl = document.getElementById("chk-auto");
         if (autoEl && msg.snapshot && typeof msg.snapshot.auto_react === "boolean") {
           autoEl.checked = msg.snapshot.auto_react;
         }
+        setAppMode("notebook");
         render();
         break;
       case "cell_formatted":
@@ -892,6 +990,74 @@ const APP_JS: &str = r#"
         setTimeout(() => card.classList.remove("flash"), 900);
       }
     });
+  }
+
+  function setAppMode(mode) {
+    document.body.classList.toggle("welcome-mode", mode === "welcome");
+    const welcomeEl = document.getElementById("welcome");
+    if (welcomeEl) welcomeEl.classList.toggle("hidden", mode !== "welcome");
+    if (mode === "welcome") {
+      editors.forEach(ed => ed.dispose());
+      editors.clear();
+      if (notebookEl) notebookEl.innerHTML = "";
+      if (sharedEl) sharedEl.innerHTML = "";
+      if (inspectorEl) inspectorEl.innerHTML = "";
+    }
+  }
+
+  function parentDir(cwd) {
+    if (!cwd) return null;
+    const parts = String(cwd).split("/").filter(Boolean);
+    if (!parts.length) return null;
+    parts.pop();
+    return parts.join("/");
+  }
+
+  function renderWelcome() {
+    if (!welcomeState) return;
+    const rootEl = document.getElementById("welcome-root");
+    const cwdEl = document.getElementById("file-cwd");
+    const listEl = document.getElementById("file-list");
+    if (rootEl) rootEl.textContent = welcomeState.root || "";
+    if (cwdEl) cwdEl.textContent = welcomeState.cwd ? "./" + welcomeState.cwd : ".";
+    if (!listEl) return;
+    listEl.innerHTML = "";
+
+    const parent = parentDir(welcomeState.cwd);
+    if (welcomeState.cwd) {
+      const up = document.createElement("button");
+      up.type = "button";
+      up.className = "file-item";
+      up.innerHTML = '<span class="file-icon" aria-hidden="true">↑</span><span class="file-name">..</span>';
+      up.onclick = () => send({ type: "list_dir", path: parent || "" });
+      listEl.appendChild(up);
+    }
+
+    const entries = welcomeState.entries || [];
+    if (!entries.length) {
+      const empty = el("div", "insp-empty");
+      empty.textContent = "No folders or .rs notebooks here";
+      listEl.appendChild(empty);
+    }
+    for (const e of entries) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "file-item" + (e.is_notebook ? " notebook" : "");
+      const icon = e.is_dir ? "▸" : "·";
+      btn.innerHTML = `<span class="file-icon" aria-hidden="true">${icon}</span><span class="file-name"></span>`;
+      btn.querySelector(".file-name").textContent = e.name;
+      if (e.is_dir) {
+        btn.onclick = () => send({ type: "list_dir", path: e.path });
+      } else {
+        btn.onclick = () => send({ type: "open_notebook", path: e.path });
+      }
+      listEl.appendChild(btn);
+    }
+
+    const autoEl = document.getElementById("chk-auto");
+    if (autoEl && typeof welcomeState.auto_react === "boolean") {
+      autoEl.checked = welcomeState.auto_react;
+    }
   }
 
   function makeInspSection(id, label, count, buildList) {
@@ -1792,6 +1958,22 @@ const APP_JS: &str = r#"
   document.getElementById("chk-auto").onchange = (e) => {
     send({ type: "set_auto", enabled: !!e.target.checked });
   };
+  const homeBtn = document.getElementById("btn-home");
+  if (homeBtn) {
+    homeBtn.onclick = () => {
+      if (document.body.classList.contains("welcome-mode")) return;
+      send({ type: "close_notebook" });
+    };
+  }
+  const newNbBtn = document.getElementById("btn-new-notebook");
+  if (newNbBtn) {
+    newNbBtn.onclick = () => {
+      const name = prompt("Notebook name (without .rs)", "notebook");
+      if (!name) return;
+      const dir = (welcomeState && welcomeState.cwd) || "";
+      send({ type: "create_notebook", name, dir });
+    };
+  }
 
   document.querySelectorAll(".main-tab").forEach(tab => {
     tab.onclick = () => {

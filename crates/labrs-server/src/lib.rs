@@ -3,8 +3,8 @@
 mod protocol;
 mod static_files;
 
-use crate::protocol::{ClientMessage, ServerMessage};
-use anyhow::Result;
+use crate::protocol::{ClientMessage, DirEntry, ServerMessage};
+use anyhow::{bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -13,28 +13,49 @@ use axum::Router;
 use labrs_core::fmt::rustfmt_cell_source;
 use labrs_core::graph::transitive_dependents;
 use labrs_core::{strip_labrs_attrs, with_labrs_attr, AddKind, MoveDirection, Session};
+use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 struct AppState {
-    session: Arc<Mutex<Session>>,
+    /// Filesystem root for browsing (usually process cwd).
+    root: PathBuf,
+    session: Arc<Mutex<Option<Session>>>,
+    auto_react: Arc<Mutex<bool>>,
+    /// Current browse directory relative to root (welcome mode).
+    browse_cwd: Arc<Mutex<String>>,
 }
 
 /// Serve the notebook UI on the given port.
 pub async fn serve(file: PathBuf, port: u16) -> Result<()> {
-    serve_with_options(file, port, true).await
+    serve_with_options(Some(file), port, true).await
 }
 
-/// Serve with explicit auto-reactivity default.
-pub async fn serve_with_options(file: PathBuf, port: u16, auto_react: bool) -> Result<()> {
-    let mut session = Session::open(&file)?;
-    session.set_auto_react(auto_react);
+/// Serve with optional notebook path and auto-reactivity default.
+pub async fn serve_with_options(file: Option<PathBuf>, port: u16, auto_react: bool) -> Result<()> {
+    let root = std::env::current_dir().context("current_dir")?;
+    let session = match file {
+        Some(path) => {
+            let mut s = Session::open(&path)?;
+            s.set_auto_react(auto_react);
+            tracing::info!("notebook: {}", path.display());
+            Some(s)
+        }
+        None => {
+            tracing::info!("no notebook — welcome / file browser");
+            None
+        }
+    };
+
     let state = AppState {
+        root: root.canonicalize().unwrap_or(root),
         session: Arc::new(Mutex::new(session)),
+        auto_react: Arc::new(Mutex::new(auto_react)),
+        browse_cwd: Arc::new(Mutex::new(String::new())),
     };
 
     let app = Router::new()
@@ -47,7 +68,6 @@ pub async fn serve_with_options(file: PathBuf, port: u16, auto_react: bool) -> R
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!("labrs UI: http://{addr}");
-    tracing::info!("notebook: {}", file.display());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -59,8 +79,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     {
-        let session = state.session.lock().await;
-        if send_msg(&mut socket, &full_state(&session)).await.is_err() {
+        if send_current_state(&state, &mut socket).await.is_err() {
             return;
         }
     }
@@ -98,6 +117,29 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
+async fn send_current_state(state: &AppState, socket: &mut WebSocket) -> Result<(), axum::Error> {
+    let guard = state.session.lock().await;
+    if let Some(session) = guard.as_ref() {
+        send_msg(socket, &full_state(session)).await
+    } else {
+        drop(guard);
+        let welcome = welcome_message(state).await;
+        send_msg(socket, &welcome).await
+    }
+}
+
+async fn welcome_message(state: &AppState) -> ServerMessage {
+    let cwd = state.browse_cwd.lock().await.clone();
+    let auto_react = *state.auto_react.lock().await;
+    let entries = list_dir_entries(&state.root, &cwd).unwrap_or_default();
+    ServerMessage::Welcome {
+        root: state.root.display().to_string(),
+        cwd,
+        entries,
+        auto_react,
+    }
+}
+
 async fn handle_client_msg(
     state: &AppState,
     msg: ClientMessage,
@@ -105,11 +147,93 @@ async fn handle_client_msg(
 ) -> Result<(), anyhow::Error> {
     match msg {
         ClientMessage::GetState => {
-            let session = state.session.lock().await;
-            send_msg(socket, &full_state(&session)).await?;
+            send_current_state(state, socket).await?;
         }
+        ClientMessage::ListDir { path } => {
+            let cwd = state.browse_cwd.lock().await.clone();
+            let rel = path.unwrap_or(cwd);
+            let entries = list_dir_entries(&state.root, &rel)?;
+            *state.browse_cwd.lock().await = normalize_rel(&rel);
+            send_msg(
+                socket,
+                &ServerMessage::DirListing {
+                    path: normalize_rel(&rel),
+                    entries,
+                },
+            )
+            .await?;
+        }
+        ClientMessage::OpenNotebook { path } => {
+            let abs = resolve_under_root(&state.root, &path)?;
+            if !abs.is_file() {
+                bail!("not a file: {}", abs.display());
+            }
+            if abs.extension().and_then(|e| e.to_str()) != Some("rs") {
+                bail!("open a `.rs` notebook file");
+            }
+            let mut session = Session::open(&abs)?;
+            session.set_auto_react(*state.auto_react.lock().await);
+            *state.session.lock().await = Some(session);
+            let guard = state.session.lock().await;
+            send_msg(socket, &full_state(guard.as_ref().unwrap())).await?;
+        }
+        ClientMessage::CreateNotebook { name, dir } => {
+            let cwd = state.browse_cwd.lock().await.clone();
+            let dir_rel = dir.unwrap_or(cwd);
+            let stem = name.trim().trim_end_matches(".rs");
+            if stem.is_empty() || stem.contains('/') || stem.contains('\\') || stem.contains("..") {
+                bail!("invalid notebook name");
+            }
+            let abs_dir = resolve_under_root(&state.root, &dir_rel)?;
+            if !abs_dir.is_dir() {
+                bail!("not a directory: {}", abs_dir.display());
+            }
+            let file = abs_dir.join(format!("{stem}.rs"));
+            if file.exists() {
+                bail!("{} already exists", file.display());
+            }
+            fs::write(&file, scaffold_notebook(stem))?;
+            let mut session = Session::open(&file)?;
+            session.set_auto_react(*state.auto_react.lock().await);
+            *state.session.lock().await = Some(session);
+            let guard = state.session.lock().await;
+            send_msg(socket, &full_state(guard.as_ref().unwrap())).await?;
+        }
+        ClientMessage::CloseNotebook => {
+            *state.session.lock().await = None;
+            let welcome = welcome_message(state).await;
+            send_msg(socket, &welcome).await?;
+        }
+        ClientMessage::SetAuto { enabled } => {
+            *state.auto_react.lock().await = enabled;
+            let mut guard = state.session.lock().await;
+            if let Some(session) = guard.as_mut() {
+                session.set_auto_react(enabled);
+                send_msg(socket, &full_state(session)).await?;
+            } else {
+                drop(guard);
+                let welcome = welcome_message(state).await;
+                send_msg(socket, &welcome).await?;
+            }
+        }
+        other => {
+            let mut guard = state.session.lock().await;
+            let session = guard
+                .as_mut()
+                .context("no notebook open — open or create one first")?;
+            handle_session_msg(session, other, socket).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_session_msg(
+    session: &mut Session,
+    msg: ClientMessage,
+    socket: &mut WebSocket,
+) -> Result<(), anyhow::Error> {
+    match msg {
         ClientMessage::EditCell { name, source } => {
-            let mut session = state.session.lock().await;
             let formatted = session.edit_cell(&name, &source)?;
             send_msg(
                 socket,
@@ -119,10 +243,9 @@ async fn handle_client_msg(
                 },
             )
             .await?;
-            send_msg(socket, &full_state(&session)).await?;
+            send_msg(socket, &full_state(session)).await?;
         }
         ClientMessage::EditHelper { name, source } => {
-            let mut session = state.session.lock().await;
             let formatted = session.edit_helper(&name, &source)?;
             send_msg(
                 socket,
@@ -133,13 +256,12 @@ async fn handle_client_msg(
             )
             .await?;
             if session.auto_react {
-                run_dirty_streaming(&mut session, socket).await?;
+                run_dirty_streaming(session, socket).await?;
             } else {
-                send_msg(socket, &full_state(&session)).await?;
+                send_msg(socket, &full_state(session)).await?;
             }
         }
         ClientMessage::EditDefinition { name, source } => {
-            let mut session = state.session.lock().await;
             let formatted = session.edit_definition(&name, &source)?;
             send_msg(
                 socket,
@@ -150,13 +272,12 @@ async fn handle_client_msg(
             )
             .await?;
             if session.auto_react {
-                run_dirty_streaming(&mut session, socket).await?;
+                run_dirty_streaming(session, socket).await?;
             } else {
-                send_msg(socket, &full_state(&session)).await?;
+                send_msg(socket, &full_state(session)).await?;
             }
         }
         ClientMessage::EditPreamble { source } => {
-            let mut session = state.session.lock().await;
             let formatted = session.edit_preamble(&source)?;
             send_msg(
                 socket,
@@ -164,22 +285,20 @@ async fn handle_client_msg(
             )
             .await?;
             if session.auto_react {
-                run_dirty_streaming(&mut session, socket).await?;
+                run_dirty_streaming(session, socket).await?;
             } else {
-                send_msg(socket, &full_state(&session)).await?;
+                send_msg(socket, &full_state(session)).await?;
             }
         }
         ClientMessage::EditMarkdown { name, content } => {
-            let mut session = state.session.lock().await;
             session.edit_markdown(&name, &content)?;
-            send_msg(socket, &full_state(&session)).await?;
+            send_msg(socket, &full_state(session)).await?;
         }
         ClientMessage::AddItem {
             kind,
             after_kind,
             after_name,
         } => {
-            let mut session = state.session.lock().await;
             let add = AddKind::parse(&kind)?;
             let after = match (after_kind.as_deref(), after_name.as_deref()) {
                 (None, None) => None,
@@ -187,37 +306,33 @@ async fn handle_client_msg(
                     Some((AddKind::Cell, "__start__".into()))
                 }
                 (Some(k), Some(n)) => Some((AddKind::parse(k)?, n.to_string())),
-                _ => anyhow::bail!("after_kind and after_name must both be set or both omitted"),
+                _ => bail!("after_kind and after_name must both be set or both omitted"),
             };
             let _name = session.add_item(add, after)?;
-            send_msg(socket, &full_state(&session)).await?;
+            send_msg(socket, &full_state(session)).await?;
         }
         ClientMessage::ChangeKind { name, from, to } => {
-            let mut session = state.session.lock().await;
             session.change_kind(&name, AddKind::parse(&from)?, AddKind::parse(&to)?)?;
-            send_msg(socket, &full_state(&session)).await?;
+            send_msg(socket, &full_state(session)).await?;
         }
         ClientMessage::DeleteItem { kind, name } => {
-            let mut session = state.session.lock().await;
             session.delete_item(AddKind::parse(&kind)?, &name)?;
-            send_msg(socket, &full_state(&session)).await?;
+            send_msg(socket, &full_state(session)).await?;
         }
         ClientMessage::MoveItem {
             kind,
             name,
             direction,
         } => {
-            let mut session = state.session.lock().await;
             let dir = match direction.as_str() {
                 "up" => MoveDirection::Up,
                 "down" => MoveDirection::Down,
-                other => anyhow::bail!("unknown direction `{other}`"),
+                other => bail!("unknown direction `{other}`"),
             };
             session.move_item(AddKind::parse(&kind)?, &name, dir)?;
-            send_msg(socket, &full_state(&session)).await?;
+            send_msg(socket, &full_state(session)).await?;
         }
         ClientMessage::RunCell { name } => {
-            let mut session = state.session.lock().await;
             if let Some(cell) = session.notebook.cell(&name).cloned() {
                 let bare = strip_labrs_attrs(&cell.source);
                 let for_disk = with_labrs_attr(&bare, "cell");
@@ -226,15 +341,9 @@ async fn handle_client_msg(
                     session.edit_cell(&name, &bare)?;
                 }
             }
-            run_reactive_streaming(&mut session, &name, socket).await?;
-        }
-        ClientMessage::SetAuto { enabled } => {
-            let mut session = state.session.lock().await;
-            session.set_auto_react(enabled);
-            send_msg(socket, &full_state(&session)).await?;
+            run_reactive_streaming(session, &name, socket).await?;
         }
         ClientMessage::RunAll => {
-            let mut session = state.session.lock().await;
             let names: Vec<String> = session
                 .notebook
                 .cells
@@ -244,15 +353,123 @@ async fn handle_client_msg(
             for name in names {
                 session.dirty.insert(name, true);
             }
-            run_dirty_streaming(&mut session, socket).await?;
+            run_dirty_streaming(session, socket).await?;
         }
         ClientMessage::Reload => {
-            let mut session = state.session.lock().await;
             session.reload()?;
-            send_msg(socket, &full_state(&session)).await?;
+            send_msg(socket, &full_state(session)).await?;
         }
+        _ => bail!("unexpected message for open notebook"),
     }
     Ok(())
+}
+
+fn scaffold_notebook(stem: &str) -> String {
+    format!(
+        r##"//! # {stem}
+//!
+//! A labrs notebook. Cells are bindings; plain functions are helpers.
+
+use labrs::prelude::*;
+
+/// Helper: reusable logic (not a notebook binding)
+fn double(val: u16) -> u16 {{
+    2 * val
+}}
+
+#[labrs::markdown]
+pub const intro: &str = r#"# Welcome to labrs
+
+Cells are named bindings. Helpers are plain functions."#;
+
+/// Input value
+#[labrs::cell]
+pub fn val() -> u16 {{
+    4
+}}
+
+/// Report using the helper and the `val` cell
+#[labrs::cell]
+pub fn report(val: &u16) -> String {{
+    let double_val = double(*val);
+    let msg = format!("Double of {{val}} is {{double_val}}");
+    println!("{{msg}}");
+    msg
+}}
+"##
+    )
+}
+
+fn normalize_rel(path: &str) -> String {
+    let p = path.trim().trim_start_matches("./").trim_matches('/');
+    if p.is_empty() || p == "." {
+        String::new()
+    } else {
+        p.replace('\\', "/")
+    }
+}
+
+fn resolve_under_root(root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel = normalize_rel(rel);
+    let candidate = if rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&rel)
+    };
+    let canon = candidate
+        .canonicalize()
+        .with_context(|| format!("path not found: {}", candidate.display()))?;
+    if !canon.starts_with(root) {
+        bail!("path escapes workspace root");
+    }
+    // Reject odd components in relative form
+    for c in Path::new(&rel).components() {
+        match c {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            _ => bail!("invalid path component"),
+        }
+    }
+    Ok(canon)
+}
+
+fn list_dir_entries(root: &Path, rel: &str) -> Result<Vec<DirEntry>> {
+    let abs = resolve_under_root(root, rel)?;
+    if !abs.is_dir() {
+        bail!("not a directory");
+    }
+    let rel_norm = normalize_rel(rel);
+    let mut entries = Vec::new();
+    let mut read: Vec<_> = fs::read_dir(&abs)?.filter_map(|e| e.ok()).collect();
+    read.sort_by_key(|e| {
+        (
+            !e.path().is_dir(),
+            e.file_name().to_string_lossy().to_lowercase(),
+        )
+    });
+    for e in read {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let is_dir = e.path().is_dir();
+        let is_notebook = !is_dir && name.ends_with(".rs");
+        if !is_dir && !is_notebook {
+            continue;
+        }
+        let path = if rel_norm.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_norm}/{name}")
+        };
+        entries.push(DirEntry {
+            name,
+            path,
+            is_dir,
+            is_notebook,
+        });
+    }
+    Ok(entries)
 }
 
 async fn run_reactive_streaming(

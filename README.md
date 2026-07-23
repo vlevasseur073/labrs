@@ -11,7 +11,7 @@ labrs sits in the same space as Pluto / marimo, adapted to Rust: cells are named
 - **Dependency graph** — edges from cell parameter names; topo-run + dirty / output-hash cascade
 - **Execution model** — per-cell temp (or cached) Cargo crate, `cargo run`, JSON return value + captured stdout/stderr
 - **Session** — dirty tracking, Auto-run cascade, edit/reload of cells, helpers, structures, and preamble
-- **CLI** — `new`, `graph`, `run`, `fmt`, `serve`
+- **CLI** — `new`, `graph`, `run`, `fmt`, `edit`
 - **Web server** — Axum + WebSocket (`labrs-server`)
 - **Editor UI** — Monaco (embedded HTML/CSS/JS), Notebook / Shared panes, Inspector + Plan sidebar
 
@@ -23,14 +23,16 @@ cargo install --path crates/labrs
 labrs new hello
 labrs graph hello.rs
 labrs run hello.rs
-labrs serve hello.rs          # http://127.0.0.1:8080
-labrs serve hello.rs --no-auto  # manual dirty mode (no cascade)
+labrs edit hello.rs          # open a notebook
+labrs edit                   # welcome / file browser
+labrs edit --no-auto         # manual dirty mode (no cascade)
 ```
 
 Or from the repo:
 
 ```bash
-cargo run -p labrs -- serve examples/demo.rs
+cargo run -p labrs -- edit
+cargo run -p labrs -- edit examples/demo.rs
 ```
 
 ## Mental model: Notebook vs Shared
@@ -162,7 +164,7 @@ labrs graph examples/demo.rs
 
 Output change detection uses a hash of the serialized return value, so cascading only continues when the upstream value actually changed.
 
-`labrs serve --no-auto` starts with Auto-run off; the toolbar **Auto-run** checkbox toggles the same setting live.
+`labrs edit --no-auto` starts with Auto-run off; the toolbar **Auto-run** checkbox toggles the same setting live.
 
 ---
 
@@ -205,7 +207,7 @@ Cells that only need helpers/types still compile against the full shared prelude
 ## Web UI
 
 ```bash
-labrs serve notebook.rs
+labrs edit notebook.rs
 # open http://127.0.0.1:8080
 ```
 
@@ -238,7 +240,7 @@ Monaco editors strip `#[labrs::…]` attributes in the UI and restore them when 
 | `labrs graph <file>` | Print cells, helpers, edges, topo order, diagnostics. |
 | `labrs run <file> [--no-fmt]` | Format (unless `--no-fmt`) and topo-run all cells. |
 | `labrs fmt <file>` | rustfmt the notebook. |
-| `labrs serve <file> [--port 8080] [--no-auto]` | Web UI. |
+| `labrs edit [file] [--port 8080] [--no-auto]` | Web UI (optional file → welcome / browser). |
 
 ---
 

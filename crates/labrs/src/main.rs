@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use labrs_core::fmt::rustfmt_file;
 use labrs_core::graph::build_graph;
 use labrs_core::parse::parse_notebook;
@@ -35,8 +36,9 @@ enum Commands {
         no_fmt: bool,
     },
     /// Start the interactive web UI
-    Serve {
-        file: PathBuf,
+    Edit {
+        /// Notebook to open (optional — omit for welcome / file browser)
+        file: Option<PathBuf>,
         #[arg(long, default_value = "8080")]
         port: u16,
         /// Disable automatic re-run of dependent cells (Pluto-style cascade is on by default)
@@ -63,15 +65,60 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Run { file, no_fmt } => cmd_run(&file, !no_fmt),
-        Commands::Serve {
+        Commands::Edit {
             file,
             port,
             no_auto,
         } => {
+            println!("{}", welcome(port, file.as_deref()));
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(labrs_server::serve_with_options(file, port, !no_auto))
         }
     }
+}
+
+fn welcome(port: u16, file: Option<&Path>) -> String {
+    let url = format!("http://127.0.0.1:{port}");
+    let tip = random_tip();
+    let file_line = match file {
+        Some(p) => format!("\n\t  {}", format!("notebook  {}", p.display()).dimmed()),
+        None => format!("\n\t  {}", "welcome · browse or create a notebook".dimmed()),
+    };
+    format!(
+        "\n\t{}\n\t ➜  {}:  {}{}\n\n\t{} {}\n",
+        "labrs".green().bold(),
+        "UI".green(),
+        url.cyan().underline(),
+        file_line,
+        "💡 Tip:".yellow().bold(),
+        tip.dimmed(),
+    )
+}
+
+fn random_tip() -> &'static str {
+    const TIPS: &[&str] = &[
+        "labrs new hello          — scaffold a notebook (.rs + optional Cargo.toml)",
+        "labrs edit               — open the UI without a file (file browser + New notebook)",
+        "labrs edit notebook.rs   — jump straight into a notebook",
+        "labrs edit --port 3000   — serve the UI on another port",
+        "labrs edit --no-auto     — disable Auto-run cascade (manual dirty mode)",
+        "labrs graph notebook.rs  — print the cell DAG, helpers, and diagnostics",
+        "labrs run notebook.rs    — topo-run all cells from the CLI",
+        "labrs run notebook.rs --no-fmt  — skip rustfmt before a CLI run",
+        "labrs fmt notebook.rs    — format the notebook with rustfmt",
+        "In the UI: Detach Shared to edit helpers/structures beside Notebook",
+        "In Shared: uncheck Read-only to edit helpers, structures, and preamble",
+        "Cell params are dependencies: fn report(val: &u16) depends on cell `val`",
+        "Plain fns are helpers (not in the DAG); mark cells with #[labrs::cell]",
+        "Click the labrs brand in the UI to return to the file browser",
+        "Toggle Auto-run in the toolbar to cascade dependents when outputs change",
+    ];
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as usize)
+        .unwrap_or(0)
+        % TIPS.len();
+    TIPS[idx]
 }
 
 fn cmd_new(name: &str, workspace: bool) -> Result<()> {
@@ -118,7 +165,7 @@ pub fn report(val: &u16) -> String {{
     ensure_cargo_toml(stem, workspace)?;
     println!("Created {}", file.display());
     println!("  labrs run {}", file.display());
-    println!("  labrs serve {}", file.display());
+    println!("  labrs edit {}", file.display());
     Ok(())
 }
 

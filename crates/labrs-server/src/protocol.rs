@@ -7,6 +7,23 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     GetState,
+    /// List directory under the server root (relative path).
+    ListDir {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// Open an existing `.rs` notebook.
+    OpenNotebook {
+        path: String,
+    },
+    /// Create a new notebook (`name` stem or `name.rs`) under `dir` (relative).
+    CreateNotebook {
+        name: String,
+        #[serde(default)]
+        dir: Option<String>,
+    },
+    /// Return to the welcome / file browser (unload current notebook).
+    CloseNotebook,
     EditCell {
         name: String,
         source: String,
@@ -62,6 +79,17 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// No notebook open — show welcome / file browser.
+    Welcome {
+        root: String,
+        cwd: String,
+        entries: Vec<DirEntry>,
+        auto_react: bool,
+    },
+    DirListing {
+        path: String,
+        entries: Vec<DirEntry>,
+    },
     NotebookState {
         snapshot: SessionSnapshot,
         notebook_source: String,
@@ -97,6 +125,14 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub is_notebook: bool,
 }
 
 #[derive(Debug, Serialize)]

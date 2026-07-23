@@ -1,0 +1,26 @@
+[package]
+name = "labrs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reactive notebook environment for Rust"
+readme = "../../README.md"
+
+[[bin]]
+name = "labrs"
+path = "src/main.rs"
+
+[dependencies]
+labrs-core = { workspace = true }
+labrs-macros = { workspace = true }
+labrs-server = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+
+[lib]
+name = "labrs"
+path = "src/lib.rs"

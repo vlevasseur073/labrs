@@ -1,0 +1,25 @@
+[package]
+name = "labrs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core parser, dependency graph, and execution engine for labrs"
+
+[dependencies]
+labrs-macros = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+which = { workspace = true }
+tracing = { workspace = true }
+prettyplease = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

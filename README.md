@@ -226,6 +226,7 @@ labrs edit notebook.rs
 
 - **Auto-run** — cascade dependents when upstream outputs change.
 - **Run all** — topo-run every cell.
+- **Clear outputs** — drop all cell return values and logs (cells become pristine).
 - **Reload** — re-parse the file from disk.
 
 Monaco editors strip `#[labrs::…]` attributes in the UI and restore them when writing back to the `.rs` file.

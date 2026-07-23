@@ -383,6 +383,10 @@ async fn handle_session_msg(
             }
             run_dirty_streaming(session, socket).await?;
         }
+        ClientMessage::ClearOutputs => {
+            session.clear_outputs();
+            send_msg(socket, &full_state(session)).await?;
+        }
         ClientMessage::Reload => {
             session.reload()?;
             send_msg(socket, &full_state(session)).await?;

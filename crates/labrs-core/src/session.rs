@@ -696,6 +696,14 @@ impl Session {
         Ok(outputs)
     }
 
+    /// Drop all cell return values / logs and reset dirty flags (UI → pristine).
+    pub fn clear_outputs(&mut self) {
+        self.outputs.clear();
+        for cell in &self.notebook.cells {
+            self.dirty.insert(cell.name.clone(), false);
+        }
+    }
+
     pub fn dep_values(&self) -> HashMap<String, Value> {
         self.outputs
             .iter()

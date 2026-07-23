@@ -73,6 +73,8 @@ pub enum ClientMessage {
         enabled: bool,
     },
     RunAll,
+    /// Clear all cell outputs (return values and logs).
+    ClearOutputs,
     Reload,
 }
 

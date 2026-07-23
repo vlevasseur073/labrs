@@ -52,6 +52,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         Auto-run
       </label>
       <button id="btn-run-all" class="primary">Run all</button>
+      <button id="btn-clear-outputs" title="Clear all cell return values and logs">Clear outputs</button>
       <button id="btn-reload">Reload</button>
       <span id="conn" class="conn">connecting…</span>
     </div>
@@ -172,6 +173,7 @@ body.welcome-mode .workspace { display: none !important; }
 body.welcome-mode .menu-btn { display: none; }
 body.welcome-mode #notebook-actions .auto-toggle,
 body.welcome-mode #btn-run-all,
+body.welcome-mode #btn-clear-outputs,
 body.welcome-mode #btn-reload { display: none; }
 body:not(.welcome-mode) #welcome { display: none !important; }
 .file-browser {
@@ -2063,6 +2065,7 @@ const APP_JS: &str = r##"
   }
 
   document.getElementById("btn-run-all").onclick = () => send({ type: "run_all" });
+  document.getElementById("btn-clear-outputs").onclick = () => send({ type: "clear_outputs" });
   document.getElementById("btn-reload").onclick = () => send({ type: "reload" });
   document.getElementById("chk-auto").onchange = (e) => {
     send({ type: "set_auto", enabled: !!e.target.checked });

@@ -12,7 +12,7 @@ use axum::routing::get;
 use axum::Router;
 use labrs_core::fmt::rustfmt_cell_source;
 use labrs_core::graph::transitive_dependents;
-use labrs_core::{strip_labrs_attrs, with_labrs_attr, AddKind, Session};
+use labrs_core::{strip_labrs_attrs, with_labrs_attr, AddKind, MoveDirection, Session};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -138,6 +138,39 @@ async fn handle_client_msg(
                 send_msg(socket, &full_state(&session)).await?;
             }
         }
+        ClientMessage::EditDefinition { name, source } => {
+            let mut session = state.session.lock().await;
+            let formatted = session.edit_definition(&name, &source)?;
+            send_msg(
+                socket,
+                &ServerMessage::DefinitionFormatted {
+                    name: name.clone(),
+                    source: formatted,
+                },
+            )
+            .await?;
+            if session.auto_react {
+                run_dirty_streaming(&mut session, socket).await?;
+            } else {
+                send_msg(socket, &full_state(&session)).await?;
+            }
+        }
+        ClientMessage::EditPreamble { source } => {
+            let mut session = state.session.lock().await;
+            let formatted = session.edit_preamble(&source)?;
+            send_msg(
+                socket,
+                &ServerMessage::PreambleFormatted {
+                    source: formatted,
+                },
+            )
+            .await?;
+            if session.auto_react {
+                run_dirty_streaming(&mut session, socket).await?;
+            } else {
+                send_msg(socket, &full_state(&session)).await?;
+            }
+        }
         ClientMessage::EditMarkdown { name, content } => {
             let mut session = state.session.lock().await;
             session.edit_markdown(&name, &content)?;
@@ -164,6 +197,25 @@ async fn handle_client_msg(
         ClientMessage::ChangeKind { name, from, to } => {
             let mut session = state.session.lock().await;
             session.change_kind(&name, AddKind::parse(&from)?, AddKind::parse(&to)?)?;
+            send_msg(socket, &full_state(&session)).await?;
+        }
+        ClientMessage::DeleteItem { kind, name } => {
+            let mut session = state.session.lock().await;
+            session.delete_item(AddKind::parse(&kind)?, &name)?;
+            send_msg(socket, &full_state(&session)).await?;
+        }
+        ClientMessage::MoveItem {
+            kind,
+            name,
+            direction,
+        } => {
+            let mut session = state.session.lock().await;
+            let dir = match direction.as_str() {
+                "up" => MoveDirection::Up,
+                "down" => MoveDirection::Down,
+                other => anyhow::bail!("unknown direction `{other}`"),
+            };
+            session.move_item(AddKind::parse(&kind)?, &name, dir)?;
             send_msg(socket, &full_state(&session)).await?;
         }
         ClientMessage::RunCell { name } => {
@@ -357,7 +409,14 @@ fn full_state(session: &Session) -> ServerMessage {
                 source: strip_labrs_attrs(&c.source),
                 docs: c.docs.clone(),
                 return_type: c.return_type.clone(),
-                params: c.params.iter().map(|p| p.name.clone()).collect(),
+                params: c
+                    .params
+                    .iter()
+                    .map(|p| protocol::ParamDetail {
+                        name: p.name.clone(),
+                        ty: p.ty.clone(),
+                    })
+                    .collect(),
             })
             .collect(),
         helpers_detail: session
@@ -378,6 +437,16 @@ fn full_state(session: &Session) -> ServerMessage {
                 name: m.name.clone(),
                 content: m.content.clone(),
                 source: m.source.clone(),
+            })
+            .collect(),
+        definitions_detail: session
+            .notebook
+            .definitions
+            .iter()
+            .map(|d| protocol::DefinitionDetail {
+                name: d.name.clone(),
+                kind: d.kind.clone(),
+                source: d.source.clone(),
             })
             .collect(),
     }

@@ -3,9 +3,24 @@
 //! Demonstrates helpers vs cells.
 
 use labrs::prelude::*;
+use serde::{Deserialize, Serialize};
 
 fn double(val: u16) -> u16 {
-    10 * val
+    2 * val
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MyStruct {
+    a: i32,
+    path: String,
+    b: bool,
+    c: u16,
+}
+
+impl MyStruct {
+    fn new(a: i32, path: String, b: bool, c: u16) -> Self {
+        Self { a, path, b, c }
+    }
 }
 
 fn foo() {
@@ -36,7 +51,7 @@ pub fn process(greeting: &String) -> String {
 
 #[labrs::cell]
 pub fn val() -> u16 {
-    4
+    8
 }
 
 #[labrs::cell]
@@ -45,4 +60,16 @@ pub fn report(val: &u16) -> String {
     let msg = format!("Double of {val} is {double_val}");
     println!("{msg}");
     msg
+}
+
+#[labrs::cell]
+pub fn my_struct() -> MyStruct {
+    let my_struct = MyStruct::new(12, "/toto/titi".to_string(), false, 1);
+    my_struct
+}
+
+#[labrs::cell]
+pub fn use_my_struct(my_struct: MyStruct) -> i32 {
+    println!("{:?}", my_struct);
+    0
 }

@@ -16,7 +16,7 @@ pub use notebook::{
     Cell, CellId, Helper, ItemKind, MarkdownCell, Notebook, OrderEntry, SharedDef,
 };
 pub use parse::parse_notebook;
-pub use session::{AddKind, CellState, CellStatus, Session, SessionSnapshot};
+pub use session::{AddKind, CellState, CellStatus, MoveDirection, Session, SessionSnapshot};
 pub use source_util::{strip_labrs_attrs, with_labrs_attr};
 
 /// Common imports for labrs notebooks.

@@ -485,6 +485,144 @@ pub fn replace_helper_source(
     replace_named_fn(notebook_source, helper_name, old_source, new_fn_source)
 }
 
+/// Replace a shared definition (struct/use/impl/…) using its parse span and/or old text.
+pub fn replace_definition_source(
+    notebook_source: &str,
+    name: &str,
+    span: (usize, usize),
+    old_source: &str,
+    new_source: &str,
+) -> Result<String> {
+    let new_source = new_source.trim();
+    if !old_source.is_empty() {
+        if let Some(idx) = notebook_source.find(old_source) {
+            let mut out = String::new();
+            out.push_str(&notebook_source[..idx]);
+            out.push_str(new_source);
+            out.push('\n');
+            out.push_str(&notebook_source[idx + old_source.len()..]);
+            return Ok(out);
+        }
+    }
+    let (start, end) = span;
+    if end > start && end <= notebook_source.len() {
+        let start = extend_back_over_attrs(notebook_source, start);
+        let mut out = String::new();
+        out.push_str(&notebook_source[..start]);
+        out.push_str(new_source);
+        out.push('\n');
+        out.push_str(&notebook_source[end..]);
+        return Ok(out);
+    }
+    bail!("could not locate definition `{name}` in notebook source");
+}
+
+/// Replace all preamble-like definitions (`use`, synthetic `item`, …) as one contiguous block.
+pub fn replace_preamble_block(
+    notebook_source: &str,
+    defs: &[(String, (usize, usize), String)],
+    new_source: &str,
+) -> Result<String> {
+    if defs.is_empty() {
+        // Insert after leading doc comments / blank lines, before first code item.
+        let insert_at = skip_leading_docs(notebook_source);
+        let mut out = String::new();
+        out.push_str(&notebook_source[..insert_at]);
+        let body = new_source.trim();
+        if !body.is_empty() {
+            out.push_str(body);
+            out.push_str("\n\n");
+        }
+        out.push_str(notebook_source[insert_at..].trim_start());
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        return Ok(out);
+    }
+
+    let mut ordered = defs.to_vec();
+    ordered.sort_by_key(|(_, span, _)| span.0);
+    let (first_name, (start0, _), first_old) = &ordered[0];
+    let mut start = *start0;
+    let mut end = ordered[0].1 .1;
+    for (_, (s, e), _) in &ordered[1..] {
+        if *e > end {
+            end = *e;
+        }
+        if *s < start {
+            start = *s;
+        }
+    }
+
+    // Prefer exact multi-source join match when spans look invalid.
+    if end <= start || end > notebook_source.len() {
+        let joined: String = ordered
+            .iter()
+            .map(|(_, _, src)| src.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !joined.is_empty() {
+            if let Some(idx) = notebook_source.find(&joined) {
+                let mut out = String::new();
+                out.push_str(&notebook_source[..idx]);
+                let body = new_source.trim();
+                if !body.is_empty() {
+                    out.push_str(body);
+                    out.push('\n');
+                }
+                out.push_str(&notebook_source[idx + joined.len()..]);
+                return Ok(out);
+            }
+        }
+        // Fall back to replacing the first def only, then delete the rest front-to-back carefully.
+        let _ = first_name;
+        let _ = first_old;
+        bail!("could not locate preamble block in notebook source");
+    }
+
+    // Expand region to include whitespace between items and attrs on the first.
+    start = extend_back_over_attrs(notebook_source, start);
+    // Include trailing newline after last item if present.
+    while end < notebook_source.len()
+        && (notebook_source.as_bytes()[end] == b'\n' || notebook_source.as_bytes()[end] == b'\r')
+    {
+        end += 1;
+        break;
+    }
+
+    let mut out = String::new();
+    out.push_str(&notebook_source[..start]);
+    let body = new_source.trim();
+    if !body.is_empty() {
+        out.push_str(body);
+        out.push('\n');
+        if !notebook_source[end..].starts_with('\n') {
+            out.push('\n');
+        }
+    }
+    out.push_str(&notebook_source[end..]);
+    Ok(out)
+}
+
+fn skip_leading_docs(source: &str) -> usize {
+    let mut i = 0;
+    let bytes = source.as_bytes();
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r') {
+            i += 1;
+        }
+        if source[i..].starts_with("//!") || source[i..].starts_with("//") {
+            if let Some(nl) = source[i..].find('\n') {
+                i += nl + 1;
+                continue;
+            }
+            return source.len();
+        }
+        break;
+    }
+    i
+}
+
 fn replace_named_fn(
     notebook_source: &str,
     name: &str,
@@ -567,6 +705,77 @@ pub fn prepend_item(notebook_source: &str, item: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Remove an item and tidy surrounding blank lines.
+pub fn delete_item_block(notebook_source: &str, kind: &str, name: &str) -> Result<String> {
+    let (start, end) = item_full_span(notebook_source, kind, name)?;
+    let mut from = start;
+    let mut to = end;
+    // eat preceding blank line
+    while from > 0 && notebook_source.as_bytes()[from - 1] == b'\n' {
+        from -= 1;
+        if from > 0 && notebook_source.as_bytes()[from - 1] == b'\n' {
+            break;
+        }
+    }
+    // eat following blank lines (keep one max)
+    while to < notebook_source.len() && notebook_source.as_bytes()[to] == b'\n' {
+        to += 1;
+    }
+    let mut out = String::new();
+    out.push_str(&notebook_source[..from]);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(notebook_source[to..].trim_start_matches('\n'));
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Swap two items in the source file.
+pub fn swap_item_blocks(
+    notebook_source: &str,
+    kind_a: &str,
+    name_a: &str,
+    kind_b: &str,
+    name_b: &str,
+) -> Result<String> {
+    let (a0, a1) = item_full_span(notebook_source, kind_a, name_a)?;
+    let (b0, b1) = item_full_span(notebook_source, kind_b, name_b)?;
+    let (first0, first1, second0, second1) = if a0 < b0 {
+        (a0, a1, b0, b1)
+    } else {
+        (b0, b1, a0, a1)
+    };
+    if first1 > second0 {
+        bail!("cannot swap overlapping items");
+    }
+    let first = notebook_source[first0..first1].trim_end();
+    let second = notebook_source[second0..second1].trim_end();
+    let mid = notebook_source[first1..second0].trim();
+    let mut out = String::new();
+    out.push_str(&notebook_source[..first0]);
+    out.push_str(second);
+    out.push_str("\n\n");
+    if !mid.is_empty() {
+        out.push_str(mid);
+        out.push_str("\n\n");
+    }
+    out.push_str(first);
+    out.push('\n');
+    let rest = notebook_source[second1..].trim_start_matches('\n');
+    if !rest.is_empty() {
+        out.push('\n');
+        out.push_str(rest);
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Insert `item` immediately after the named notebook item (`cell` / `helper` / `markdown`).

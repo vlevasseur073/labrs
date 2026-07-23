@@ -2,13 +2,13 @@
 
 use crate::diagnose::Diagnostic;
 use crate::execute::{
-    append_item, insert_after_item, prepend_item, replace_cell_source, replace_helper_source,
-    replace_item_block, replace_markdown_content, write_notebook, CellOutput, ExecuteOptions,
-    Executor,
+    append_item, delete_item_block, insert_after_item, prepend_item, replace_cell_source,
+    replace_definition_source, replace_helper_source, replace_item_block, replace_markdown_content,
+    replace_preamble_block, swap_item_blocks, write_notebook, CellOutput, ExecuteOptions, Executor,
 };
 use crate::fmt::{rustfmt_cell_source, rustfmt_file};
 use crate::graph::{self, dependents, transitive_dependents, DependencyGraph};
-use crate::notebook::Notebook;
+use crate::notebook::{Notebook, OrderEntry};
 use crate::parse::parse_notebook;
 use crate::source_util::{fresh_name, strip_labrs_attrs, with_labrs_attr};
 use anyhow::{bail, Context, Result};
@@ -65,6 +65,13 @@ pub enum AddKind {
     Cell,
     Helper,
     Markdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveDirection {
+    Up,
+    Down,
 }
 
 impl AddKind {
@@ -158,6 +165,70 @@ impl Session {
 
     pub fn set_auto_react(&mut self, enabled: bool) {
         self.auto_react = enabled;
+    }
+
+    pub fn delete_item(&mut self, kind: AddKind, name: &str) -> Result<()> {
+        let new_file = delete_item_block(&self.notebook.source, kind.as_str(), name)?;
+        write_notebook(&self.path, &new_file)?;
+        let _ = rustfmt_file(&self.path);
+        self.outputs.remove(name);
+        self.dirty.remove(name);
+        // Dependents of a deleted cell become dirty / invalid
+        if kind == AddKind::Cell {
+            for d in dependents(&self.graph, name) {
+                self.dirty.insert(d, true);
+            }
+        }
+        self.reload()?;
+        Ok(())
+    }
+
+    /// Move an item up or down among notebook display items (cells / helpers / markdown).
+    pub fn move_item(&mut self, kind: AddKind, name: &str, direction: MoveDirection) -> Result<()> {
+        let movable: Vec<(AddKind, String)> = self
+            .notebook
+            .order
+            .iter()
+            .filter_map(|e| match e {
+                OrderEntry::Cell { id } => Some((AddKind::Cell, id.clone())),
+                OrderEntry::Helper { name } => Some((AddKind::Helper, name.clone())),
+                OrderEntry::Markdown { id } => Some((AddKind::Markdown, id.clone())),
+                OrderEntry::Definition { .. } => None,
+            })
+            .collect();
+
+        let idx = movable
+            .iter()
+            .position(|(k, n)| *k == kind && n == name)
+            .with_context(|| format!("item `{name}` not found in order"))?;
+
+        let swap_with = match direction {
+            MoveDirection::Up => {
+                if idx == 0 {
+                    return Ok(());
+                }
+                idx - 1
+            }
+            MoveDirection::Down => {
+                if idx + 1 >= movable.len() {
+                    return Ok(());
+                }
+                idx + 1
+            }
+        };
+
+        let (k2, n2) = &movable[swap_with];
+        let new_file = swap_item_blocks(
+            &self.notebook.source,
+            kind.as_str(),
+            name,
+            k2.as_str(),
+            n2,
+        )?;
+        write_notebook(&self.path, &new_file)?;
+        let _ = rustfmt_file(&self.path);
+        self.reload()?;
+        Ok(())
     }
 
     pub fn reload(&mut self) -> Result<()> {
@@ -264,6 +335,69 @@ impl Session {
             self.dirty.insert(cell_name, true);
         }
         Ok(strip_labrs_attrs(&formatted))
+    }
+
+    /// Edit a shared definition (struct, use, impl, …) by parsed name.
+    /// Marks all cells dirty (compile universe may change).
+    pub fn edit_definition(&mut self, name: &str, new_source: &str) -> Result<String> {
+        let def = self
+            .notebook
+            .definitions
+            .iter()
+            .find(|d| d.name == name)
+            .with_context(|| format!("unknown definition `{name}`"))?
+            .clone();
+        let formatted = rustfmt_cell_source(new_source.trim());
+        let new_file = replace_definition_source(
+            &self.notebook.source,
+            name,
+            def.span,
+            &def.source,
+            &formatted,
+        )?;
+        write_notebook(&self.path, &new_file)?;
+        let _ = rustfmt_file(&self.path);
+        self.reload()?;
+        for cell in &self.notebook.cells {
+            self.dirty.insert(cell.name.clone(), true);
+        }
+        let refreshed = self
+            .notebook
+            .definitions
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.source.clone())
+            .unwrap_or_else(|| formatted.clone());
+        Ok(refreshed)
+    }
+
+    /// Edit all preamble items (`use`, etc.) as a single source block.
+    pub fn edit_preamble(&mut self, new_source: &str) -> Result<String> {
+        let preamble: Vec<(String, (usize, usize), String)> = self
+            .notebook
+            .definitions
+            .iter()
+            .filter(|d| d.kind == "use" || d.kind == "item")
+            .map(|d| (d.name.clone(), d.span, d.source.clone()))
+            .collect();
+        let formatted = rustfmt_cell_source(new_source.trim());
+        let new_file = replace_preamble_block(&self.notebook.source, &preamble, &formatted)?;
+        write_notebook(&self.path, &new_file)?;
+        let _ = rustfmt_file(&self.path);
+        self.reload()?;
+        for cell in &self.notebook.cells {
+            self.dirty.insert(cell.name.clone(), true);
+        }
+        Ok(Self::join_preamble(&self.notebook.definitions))
+    }
+
+    fn join_preamble(definitions: &[crate::notebook::SharedDef]) -> String {
+        definitions
+            .iter()
+            .filter(|d| d.kind == "use" || d.kind == "item")
+            .map(|d| d.source.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Cells that reference `helper` by name, plus their transitive dependents (topo order).

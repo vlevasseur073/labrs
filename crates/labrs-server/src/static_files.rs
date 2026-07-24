@@ -262,6 +262,15 @@ button.icon.run-icon {
   color: white; background: var(--accent); border-color: var(--accent); width: 2.15rem; height: 2.15rem;
 }
 button.icon.run-icon:hover { filter: brightness(1.08); color: white; }
+button.icon.stop-icon {
+  color: white; background: var(--error); border-color: var(--error);
+  width: 2.15rem; height: 2.15rem;
+}
+button.icon.stop-icon:hover { filter: brightness(1.08); color: white; }
+button.icon.stop-icon:disabled {
+  opacity: 0.35; cursor: not-allowed; filter: none; pointer-events: none;
+  background: #f5f5f4; color: var(--muted); border-color: var(--border);
+}
 select.kind-select {
   font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em;
   padding: 0.25rem 0.45rem; border-radius: 6px; color: var(--muted); background: #fafaf9;
@@ -565,9 +574,14 @@ body.split-layout .inspector {
   display: inline-block; animation: labrs-spin 0.75s linear infinite; margin-right: 0.25rem;
 }
 .docs { padding: 0.55rem 0.95rem; color: var(--muted); font-size: 0.88rem; white-space: pre-wrap; border-bottom: 1px solid var(--border); }
-.editor { height: 150px; border-bottom: 1px solid var(--border); }
-.editor.tall { height: 210px; }
-.editor.md-edit { height: 140px; }
+.editor {
+  min-height: 5.5rem;
+  height: 5.5rem; /* overridden by JS auto-grow */
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+}
+.editor.tall { min-height: 5.5rem; }
+.editor.md-edit { min-height: 5.5rem; }
 .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 0; background: #fafaf9; }
 @media (max-width: 720px) { .panels { grid-template-columns: 1fr; } }
 .panel { padding: 0.7rem 0.9rem; min-height: 3.5rem; }
@@ -991,6 +1005,15 @@ const APP_JS: &str = r##"
         runningCells.add(msg.name);
         patchCellRunning(msg.name, true);
         break;
+      case "cell_stopped":
+        runningCells.delete(msg.name);
+        // Also clear any other cells marked running (cascade abort).
+        [...runningCells].forEach((n) => {
+          runningCells.delete(n);
+          patchCellRunning(n, false);
+        });
+        patchCellRunning(msg.name, false);
+        break;
       case "cell_output":
         runningCells.delete(msg.output.cell);
         patchCellRunning(msg.output.cell, false);
@@ -1028,6 +1051,10 @@ const APP_JS: &str = r##"
       }
     }
     if (card) {
+      const stopBtn = card.querySelector(".stop-icon");
+      const runBtn = card.querySelector(".run-icon");
+      if (stopBtn) stopBtn.disabled = !isRunning;
+      if (runBtn) runBtn.disabled = !!isRunning;
       if (isRunning) card.classList.add("running");
       else card.classList.remove("running");
     }
@@ -1501,6 +1528,8 @@ const APP_JS: &str = r##"
       initial = pendingMap.get(key).value;
       sel = pendingMap.get(key).selection;
     }
+    const MAX_EDITOR_LINES = 50;
+    const MIN_EDITOR_LINES = 4;
     const editor = monaco.editor.create(host, {
       value: initial,
       language: language || "rust",
@@ -1529,17 +1558,42 @@ const APP_JS: &str = r##"
         shareSuggestSelections: true,
         snippetsPreventQuickSuggestions: false,
       },
+      // Height is driven by the host; scroll only after we hit the max line budget.
+      scrollbar: {
+        vertical: "auto",
+        horizontal: "hidden",
+        alwaysConsumeMouseWheel: false,
+      },
     });
+
+    function fitEditorHeight() {
+      const lineHeight = editor.getOption(monaco.editor.EditorOption.lineHeight) || 20;
+      const padTop = 8;
+      const padBottom = 8;
+      const minH = MIN_EDITOR_LINES * lineHeight + padTop + padBottom;
+      const maxH = MAX_EDITOR_LINES * lineHeight + padTop + padBottom;
+      // Prefer content height (accounts for word-wrap), but never grow past 50 lines.
+      const contentH = editor.getContentHeight();
+      const next = Math.min(maxH, Math.max(minH, contentH));
+      if (Math.abs((parseFloat(host.style.height) || 0) - next) > 0.5) {
+        host.style.height = next + "px";
+        editor.layout();
+      }
+    }
+
     if (sel) editor.setSelection(sel);
     if (onSaveCmd && !readOnly) {
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, onSaveCmd);
     }
     editors.set(key, editor);
-    if ((language || "rust") === "rust") {
-      editor.onDidChangeModelContent(() => {
-        if (typeof scheduleLspSync === "function") scheduleLspSync();
-      });
-    }
+    editor.onDidContentSizeChange(() => fitEditorHeight());
+    editor.onDidChangeModelContent(() => {
+      fitEditorHeight();
+      if ((language || "rust") === "rust" && typeof scheduleLspSync === "function") {
+        scheduleLspSync();
+      }
+    });
+    requestAnimationFrame(() => fitEditorHeight());
     return editor;
   }
 
@@ -1964,7 +2018,14 @@ const APP_JS: &str = r##"
           send({ type: "edit_cell", name: c.name, source });
           setTimeout(() => send({ type: "run_cell", name: c.name }), 50);
         }, "run-icon");
-        const right = itemChrome("cell", c.name, idx, notebookOrder.length, [runBtn, statusBadge(st, c.name)]);
+        const stopBtn = iconBtn("■", "Stop execution", () => {
+          fetch("/stop?cell=" + encodeURIComponent(c.name), { method: "POST" }).catch(() => {});
+          send({ type: "stop_cell", name: c.name });
+        }, "stop-icon");
+        const isRunning = runningCells.has(c.name);
+        runBtn.disabled = isRunning;
+        stopBtn.disabled = !isRunning;
+        const right = itemChrome("cell", c.name, idx, notebookOrder.length, [runBtn, stopBtn, statusBadge(st, c.name)]);
         head.appendChild(left);
         head.appendChild(right);
         card.appendChild(head);

@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +32,235 @@ pub struct CellOutput {
 pub struct ExecuteOptions {
     pub rustfmt: bool,
     pub cache_dir: Option<PathBuf>,
+}
+
+/// Shared handle for the cargo process of the cell currently running (if any).
+/// Used by the web UI Stop button to kill execution without waiting for cargo.
+#[derive(Default)]
+pub struct ActiveRun {
+    inner: Mutex<ActiveRunState>,
+}
+
+#[derive(Default)]
+struct ActiveRunState {
+    cell: Option<String>,
+    /// Live child (`cargo run`) so Stop can call `Child::kill` directly.
+    child: Option<Child>,
+    /// Process-group leader pid (same as child), for killing rustc/binary too.
+    pid: Option<u32>,
+    /// This cell's process was killed.
+    cancelled: bool,
+    /// User requested stop — abort the current cell and any cascade/run-all.
+    stop_all: bool,
+}
+
+impl ActiveRun {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn current_cell(&self) -> Option<String> {
+        self.inner.lock().ok()?.cell.clone()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.cancelled || g.stop_all)
+            .unwrap_or(false)
+    }
+
+    pub fn should_stop(&self) -> bool {
+        self.inner.lock().map(|g| g.stop_all).unwrap_or(false)
+    }
+
+    /// Clear stop/cancel flags before a user-initiated Run / Run all.
+    pub fn clear_stop(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.stop_all = false;
+            g.cancelled = false;
+        }
+    }
+
+    pub fn begin(&self, cell: &str) {
+        if let Ok(mut g) = self.inner.lock() {
+            if let Some(mut child) = g.child.take() {
+                kill_child_tree(&mut child, g.pid.take());
+            } else if let Some(pid) = g.pid.take() {
+                kill_pid_tree(pid);
+            }
+            g.cell = Some(cell.to_string());
+            // If stop was requested mid-cascade, keep aborting.
+            g.cancelled = g.stop_all;
+        }
+    }
+
+    pub fn install_child(&self, mut child: Child) {
+        let pid = child.id();
+        if let Ok(mut g) = self.inner.lock() {
+            if g.cancelled || g.stop_all {
+                kill_child_tree(&mut child, Some(pid));
+                return;
+            }
+            g.pid = Some(pid);
+            g.child = Some(child);
+        } else {
+            kill_child_tree(&mut child, Some(pid));
+        }
+    }
+
+    /// Request cancellation and kill the running process tree.
+    /// Returns the cell name that was running, if any.
+    pub fn cancel(&self) -> Option<String> {
+        let Ok(mut g) = self.inner.lock() else {
+            return None;
+        };
+        g.stop_all = true;
+        g.cancelled = true;
+        let cell = g.cell.clone();
+        let pid = g.pid;
+        if let Some(mut child) = g.child.take() {
+            kill_child_tree(&mut child, pid);
+            g.pid = None;
+        } else if let Some(pid) = g.pid.take() {
+            kill_pid_tree(pid);
+        }
+        cell
+    }
+
+    pub fn finish(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.cell = None;
+            g.pid = None;
+            g.cancelled = false;
+            if let Some(mut child) = g.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // leave stop_all so cascade/run-all can still abort
+        }
+    }
+
+    /// Wait until the installed child exits (or is cancelled). Returns collected output.
+    pub fn wait_installed(&self) -> Result<Option<std::process::Output>> {
+        loop {
+            if self.is_cancelled() {
+                let _ = self.cancel();
+                return Ok(None);
+            }
+            let done = {
+                let Ok(mut g) = self.inner.lock() else {
+                    return Ok(None);
+                };
+                match g.child.as_mut() {
+                    Some(child) => child.try_wait().context("try_wait on cell process")?,
+                    None => return Ok(None),
+                }
+            };
+            if let Some(status) = done {
+                let Ok(mut g) = self.inner.lock() else {
+                    return Ok(None);
+                };
+                g.pid = None;
+                let mut child = match g.child.take() {
+                    Some(c) => c,
+                    None => return Ok(None),
+                };
+                // `try_wait` already reaped the status — read pipes manually.
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Ok(Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                }));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+}
+
+fn kill_child_tree(child: &mut Child, pid: Option<u32>) {
+    let pid = pid.or_else(|| Some(child.id()));
+    if let Some(pid) = pid {
+        kill_pid_tree(pid);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn kill_pid_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        // Process group (cargo was started with process_group(0)).
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", "--", &format!("-{pid}")])
+            .status();
+        // Direct children (belt and suspenders).
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-P", &pid.to_string()])
+            .status();
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", "--", &pid.to_string()])
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
+fn cancelled_output(cell_name: &str) -> CellOutput {
+    CellOutput {
+        cell: cell_name.to_string(),
+        value: Value::Null,
+        stdout: String::new(),
+        stderr: String::new(),
+        success: false,
+        error: Some("cancelled".into()),
+        value_hash: hash_value(&Value::Null),
+    }
+}
+
+fn finish_cell_output(cell_name: &str, output: std::process::Output) -> Result<CellOutput> {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Ok(CellOutput {
+            cell: cell_name.to_string(),
+            value: Value::Null,
+            stdout,
+            stderr: stderr.clone(),
+            success: false,
+            error: Some(format!("execution failed:\n{stderr}")),
+            value_hash: hash_value(&Value::Null),
+        });
+    }
+
+    let parsed = parse_all_cells(&stdout);
+    Ok(parsed
+        .into_iter()
+        .find(|o| o.cell == cell_name)
+        .unwrap_or_else(|| CellOutput {
+            cell: cell_name.to_string(),
+            value: Value::Null,
+            stdout,
+            stderr,
+            success: false,
+            error: Some("could not parse cell output protocol".into()),
+            value_hash: hash_value(&Value::Null),
+        }))
 }
 
 pub struct Executor {
@@ -99,6 +330,16 @@ impl Executor {
         cell_name: &str,
         deps: &HashMap<String, Value>,
     ) -> Result<CellOutput> {
+        self.execute_cell_tracked(notebook, cell_name, deps, None)
+    }
+
+    pub fn execute_cell_tracked(
+        &self,
+        notebook: &Notebook,
+        cell_name: &str,
+        deps: &HashMap<String, Value>,
+        active: Option<&ActiveRun>,
+    ) -> Result<CellOutput> {
         let cell = notebook
             .cell(cell_name)
             .with_context(|| format!("unknown cell `{cell_name}`"))?;
@@ -112,52 +353,56 @@ impl Executor {
             }
         }
 
+        if active.map(|a| a.is_cancelled()).unwrap_or(false) {
+            return Ok(cancelled_output(cell_name));
+        }
+
         let project = self.materialize_single_cell(notebook, cell)?;
-        let mut child = Command::new("cargo")
-            .arg("run")
+        let mut cmd = Command::new("cargo");
+        cmd.arg("run")
             .arg("--quiet")
             .current_dir(&project)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to spawn cell runner")?;
+            .stderr(Stdio::piped());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // New process group so Stop can kill cargo + rustc children together.
+            cmd.process_group(0);
+        }
+
+        let mut child = cmd.spawn().context("failed to spawn cell runner")?;
 
         {
+            // Close stdin after writing so the child is not left waiting on EOF.
             let mut stdin = child.stdin.take().context("no stdin")?;
             let payload = serde_json::to_vec(deps)?;
             stdin.write_all(&payload)?;
+            stdin.flush().ok();
+        }
+
+        if let Some(active) = active {
+            if active.is_cancelled() {
+                let pid = child.id();
+                kill_child_tree(&mut child, Some(pid));
+                return Ok(cancelled_output(cell_name));
+            }
+            active.install_child(child);
+            match active.wait_installed()? {
+                None => return Ok(cancelled_output(cell_name)),
+                Some(output) => {
+                    if active.is_cancelled() {
+                        return Ok(cancelled_output(cell_name));
+                    }
+                    return finish_cell_output(cell_name, output);
+                }
+            }
         }
 
         let output = child.wait_with_output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if !output.status.success() {
-            return Ok(CellOutput {
-                cell: cell_name.to_string(),
-                value: Value::Null,
-                stdout,
-                stderr: stderr.clone(),
-                success: false,
-                error: Some(format!("execution failed:\n{stderr}")),
-                value_hash: hash_value(&Value::Null),
-            });
-        }
-
-        let parsed = parse_all_cells(&stdout);
-        Ok(parsed
-            .into_iter()
-            .find(|o| o.cell == cell_name)
-            .unwrap_or_else(|| CellOutput {
-                cell: cell_name.to_string(),
-                value: Value::Null,
-                stdout,
-                stderr,
-                success: false,
-                error: Some("could not parse cell output protocol".into()),
-                value_hash: hash_value(&Value::Null),
-            }))
+        finish_cell_output(cell_name, output)
     }
 
     fn materialize_runner(&self, notebook: &Notebook, graph: &DependencyGraph) -> Result<PathBuf> {

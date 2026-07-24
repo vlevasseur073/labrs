@@ -7,14 +7,18 @@ mod static_files;
 use crate::protocol::{ClientMessage, DirEntry, ServerMessage};
 use anyhow::{bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
+use axum::Json;
 use axum::Router;
 use futures_util::StreamExt;
 use labrs_core::fmt::rustfmt_cell_source;
 use labrs_core::graph::transitive_dependents;
-use labrs_core::{strip_labrs_attrs, with_labrs_attr, AddKind, MoveDirection, Session};
+use labrs_core::{
+    strip_labrs_attrs, with_labrs_attr, ActiveRun, AddKind, MoveDirection, Session,
+};
+use serde::Deserialize;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -30,6 +34,8 @@ struct AppState {
     auto_react: Arc<Mutex<bool>>,
     /// Current browse directory relative to root (welcome mode).
     browse_cwd: Arc<Mutex<String>>,
+    /// Shared kill handle for the in-flight cell cargo process.
+    active_run: Arc<ActiveRun>,
 }
 
 /// Serve the notebook UI on the given port.
@@ -40,9 +46,11 @@ pub async fn serve(file: PathBuf, port: u16) -> Result<()> {
 /// Serve with optional notebook path and auto-reactivity default.
 pub async fn serve_with_options(file: Option<PathBuf>, port: u16, auto_react: bool) -> Result<()> {
     let root = std::env::current_dir().context("current_dir")?;
+    let active_run = ActiveRun::new();
     let session = match file {
         Some(path) => {
             let mut s = Session::open(&path)?;
+            s.active_run = active_run.clone();
             s.set_auto_react(auto_react);
             tracing::info!("notebook: {}", path.display());
             Some(s)
@@ -58,6 +66,7 @@ pub async fn serve_with_options(file: Option<PathBuf>, port: u16, auto_react: bo
         session: Arc::new(Mutex::new(session)),
         auto_react: Arc::new(Mutex::new(auto_react)),
         browse_cwd: Arc::new(Mutex::new(String::new())),
+        active_run,
     };
 
     let app = Router::new()
@@ -66,6 +75,7 @@ pub async fn serve_with_options(file: Option<PathBuf>, port: u16, auto_react: bo
         .route("/app.css", get(static_files::app_css))
         .route("/ws", get(ws_handler))
         .route("/lsp", get(lsp_handler))
+        .route("/stop", post(stop_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -78,6 +88,40 @@ pub async fn serve_with_options(file: Option<PathBuf>, port: u16, auto_react: bo
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+#[derive(Debug, Deserialize)]
+struct StopQuery {
+    /// Optional cell name; if omitted, stops whatever is currently running.
+    cell: Option<String>,
+}
+
+/// Kill the in-flight cell process. Used by the Stop button (HTTP so it works
+/// even while the WebSocket handler is blocked in `cargo run`).
+async fn stop_handler(
+    State(state): State<AppState>,
+    Query(q): Query<StopQuery>,
+) -> impl IntoResponse {
+    let current = state.active_run.current_cell();
+    let should = match (&current, &q.cell) {
+        (Some(running), Some(want)) => running == want,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if should {
+        // Prefer AppState handle (same Arc as the session) so Stop works while
+        // the WebSocket thread is blocked inside cargo/wait.
+        let stopped = state.active_run.cancel();
+        Json(serde_json::json!({ "ok": true, "cell": stopped }))
+    } else {
+        // Still try a blanket cancel in case the cell name is stale in the UI.
+        let stopped = state.active_run.cancel();
+        Json(serde_json::json!({
+            "ok": stopped.is_some(),
+            "cell": stopped,
+            "message": if stopped.is_some() { "stopped" } else { "no matching cell is running" }
+        }))
+    }
 }
 
 async fn lsp_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -199,7 +243,10 @@ async fn handle_client_msg(
             if abs.extension().and_then(|e| e.to_str()) != Some("rs") {
                 bail!("open a `.rs` notebook file");
             }
+            state.active_run.cancel();
+            state.active_run.finish();
             let mut session = Session::open(&abs)?;
+            session.active_run = state.active_run.clone();
             session.set_auto_react(*state.auto_react.lock().await);
             *state.session.lock().await = Some(session);
             let guard = state.session.lock().await;
@@ -221,13 +268,18 @@ async fn handle_client_msg(
                 bail!("{} already exists", file.display());
             }
             fs::write(&file, scaffold_notebook(stem))?;
+            state.active_run.cancel();
+            state.active_run.finish();
             let mut session = Session::open(&file)?;
+            session.active_run = state.active_run.clone();
             session.set_auto_react(*state.auto_react.lock().await);
             *state.session.lock().await = Some(session);
             let guard = state.session.lock().await;
             send_msg(socket, &full_state(guard.as_ref().unwrap())).await?;
         }
         ClientMessage::CloseNotebook => {
+            state.active_run.cancel();
+            state.active_run.finish();
             *state.session.lock().await = None;
             let welcome = welcome_message(state).await;
             send_msg(socket, &welcome).await?;
@@ -371,6 +423,18 @@ async fn handle_session_msg(
             }
             run_reactive_streaming(session, &name, socket).await?;
         }
+        ClientMessage::StopCell { name } => {
+            let current = session.active_run.current_cell();
+            let matched = current.as_deref() == Some(name.as_str()) || current.is_some();
+            if matched {
+                let stopped = session.active_run.cancel().unwrap_or(name);
+                send_msg(
+                    socket,
+                    &ServerMessage::CellStopped { name: stopped },
+                )
+                .await?;
+            }
+        }
         ClientMessage::RunAll => {
             let names: Vec<String> = session
                 .notebook
@@ -509,6 +573,7 @@ async fn run_reactive_streaming(
     name: &str,
     socket: &mut WebSocket,
 ) -> Result<(), anyhow::Error> {
+    session.active_run.clear_stop();
     send_msg(
         socket,
         &ServerMessage::CellRunning {
@@ -526,9 +591,25 @@ async fn run_reactive_streaming(
     )
     .await?;
 
+    if first.error.as_deref() == Some("cancelled") || session.active_run.should_stop() {
+        send_msg(
+            socket,
+            &ServerMessage::CellStopped {
+                name: name.to_string(),
+            },
+        )
+        .await?;
+        session.active_run.clear_stop();
+        send_msg(socket, &full_state(session)).await?;
+        return Ok(());
+    }
+
     if session.auto_react && first.success && changed {
         let cascade = transitive_dependents(&session.graph, name);
         for dep_name in cascade {
+            if session.active_run.should_stop() {
+                break;
+            }
             if !session.dirty.get(&dep_name).copied().unwrap_or(false) {
                 continue;
             }
@@ -557,7 +638,18 @@ async fn run_reactive_streaming(
 
             match session.run_cell_once(&dep_name) {
                 Ok((out, _)) => {
+                    let cancelled = out.error.as_deref() == Some("cancelled");
                     send_msg(socket, &ServerMessage::CellOutput { output: out }).await?;
+                    if cancelled || session.active_run.should_stop() {
+                        send_msg(
+                            socket,
+                            &ServerMessage::CellStopped {
+                                name: dep_name.clone(),
+                            },
+                        )
+                        .await?;
+                        break;
+                    }
                 }
                 Err(e) => {
                     send_msg(
@@ -571,6 +663,8 @@ async fn run_reactive_streaming(
             }
         }
     }
+
+    session.active_run.clear_stop();
 
     let dirty: Vec<String> = session
         .dirty
@@ -587,8 +681,12 @@ async fn run_dirty_streaming(
     session: &mut Session,
     socket: &mut WebSocket,
 ) -> Result<(), anyhow::Error> {
+    session.active_run.clear_stop();
     let order = session.graph.order.clone();
     for name in order {
+        if session.active_run.should_stop() {
+            break;
+        }
         if !session.dirty.get(&name).copied().unwrap_or(false) {
             continue;
         }
@@ -612,7 +710,18 @@ async fn run_dirty_streaming(
 
         match session.run_cell_once(&name) {
             Ok((out, _)) => {
+                let cancelled = out.error.as_deref() == Some("cancelled");
                 send_msg(socket, &ServerMessage::CellOutput { output: out }).await?;
+                if cancelled || session.active_run.should_stop() {
+                    send_msg(
+                        socket,
+                        &ServerMessage::CellStopped {
+                            name: name.clone(),
+                        },
+                    )
+                    .await?;
+                    break;
+                }
             }
             Err(e) => {
                 send_msg(
@@ -625,6 +734,8 @@ async fn run_dirty_streaming(
             }
         }
     }
+
+    session.active_run.clear_stop();
 
     let dirty: Vec<String> = session
         .dirty

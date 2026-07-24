@@ -69,6 +69,10 @@ pub enum ClientMessage {
     RunCell {
         name: String,
     },
+    /// Kill the cargo process for a running cell (and abort cascade).
+    StopCell {
+        name: String,
+    },
     SetAuto {
         enabled: bool,
     },
@@ -123,6 +127,10 @@ pub enum ServerMessage {
         output: CellOutput,
     },
     CellRunning {
+        name: String,
+    },
+    /// A running cell was stopped by the user.
+    CellStopped {
         name: String,
     },
     CellsDirty {

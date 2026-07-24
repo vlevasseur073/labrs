@@ -10,7 +10,7 @@ pub mod session;
 pub mod source_util;
 
 pub use diagnose::{Diagnostic, Severity};
-pub use execute::{CellOutput, ExecuteOptions, Executor};
+pub use execute::{ActiveRun, CellOutput, ExecuteOptions, Executor};
 pub use graph::{DependencyGraph, GraphError};
 pub use notebook::{Cell, CellId, Helper, ItemKind, MarkdownCell, Notebook, OrderEntry, SharedDef};
 pub use parse::parse_notebook;

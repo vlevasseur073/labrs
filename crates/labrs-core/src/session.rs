@@ -4,7 +4,8 @@ use crate::diagnose::Diagnostic;
 use crate::execute::{
     append_item, delete_item_block, insert_after_item, prepend_item, replace_cell_source,
     replace_definition_source, replace_helper_source, replace_item_block, replace_markdown_content,
-    replace_preamble_block, swap_item_blocks, write_notebook, CellOutput, ExecuteOptions, Executor,
+    replace_preamble_block, swap_item_blocks, write_notebook, ActiveRun, CellOutput, ExecuteOptions,
+    Executor,
 };
 use crate::fmt::{rustfmt_cell_source, rustfmt_file};
 use crate::graph::{self, dependents, transitive_dependents, DependencyGraph};
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +60,8 @@ pub struct Session {
     /// Pluto-style automatic cascade (default: true).
     pub auto_react: bool,
     executor: Executor,
+    /// Shared with the server so Stop can kill the cargo process.
+    pub active_run: Arc<ActiveRun>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +164,7 @@ impl Session {
             dirty,
             auto_react: true,
             executor,
+            active_run: ActiveRun::new(),
         })
     }
 
@@ -611,7 +616,19 @@ impl Session {
             deps.insert(param.name.clone(), out.value.clone());
         }
 
-        let output = self.executor.execute_cell(&self.notebook, name, &deps)?;
+        self.active_run.begin(name);
+        let output = self
+            .executor
+            .execute_cell_tracked(&self.notebook, name, &deps, Some(&self.active_run))?;
+        let cancelled = self.active_run.is_cancelled()
+            || output.error.as_deref() == Some("cancelled");
+        self.active_run.finish();
+
+        if cancelled {
+            // Do not treat cancel as a successful/failed run that dirties dependents.
+            return Ok((output, false));
+        }
+
         let old_hash = self.outputs.get(name).map(|o| o.value_hash.clone());
         self.outputs.insert(name.to_string(), output.clone());
         self.dirty.insert(name.to_string(), false);

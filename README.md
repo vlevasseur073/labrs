@@ -229,6 +229,8 @@ labrs edit notebook.rs
 - **Clear outputs** — drop all cell return values and logs (cells become pristine).
 - **Reload** — re-parse the file from disk.
 
+Each code cell has **Run** (▶) and **Stop** (■). Stop kills the in-flight `cargo` process (and aborts any auto-run cascade).
+
 Monaco editors strip `#[labrs::…]` attributes in the UI and restore them when writing back to the `.rs` file.
 
 ### Code intelligence (rust-analyzer)
